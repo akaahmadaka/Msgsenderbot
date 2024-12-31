@@ -11,7 +11,7 @@ logging.basicConfig(
 )
 
 # Configurable variables - you can modify these later
-MESSAGE_TO_SEND = "This is a periodic message"  # Change this to your desired message
+MESSAGE_TO_SEND = "https://t.me/translationx0x0xbot\n\n🔞Language_NoLimit🔞"  # Change this to your desired message
 INTERVAL_SECONDS = 60  # Change this to your desired interval in seconds
 
 # Dictionary to store active loops for different chats
