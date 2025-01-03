@@ -1,8 +1,8 @@
 import logging
 from telegram import Update, Chat
 from telegram.ext import (
-    ApplicationBuilder, 
-    CommandHandler, 
+    ApplicationBuilder,
+    CommandHandler,
     ContextTypes,
     ConversationHandler,
     MessageHandler,
@@ -27,7 +27,7 @@ class BotConfig:
     def __init__(self):
         self.config_file = 'bot_config.json'
         self.default_config = {
-            'message': "https://t.me/translationx0x0xbot\n\n🔞Language_NoLimit🔞",
+            'message': "",
             'delay': 60,
             'admin_id': 5250831809  # Replace with your ID
         }
@@ -165,15 +165,15 @@ async def send_periodic_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int
 
 async def start_loop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
-    
+
     if chat.type == Chat.PRIVATE:
         asyncio.create_task(send_periodic_message(context, chat.id))
         return
-    
+
     if chat_manager.is_active(chat.id):
-        await update.message.reply_text("Message loop already running!")
+        await update.message.reply_text("I am already getting filled 💦🥵")
         return
-    
+
     chat_manager.add_chat(chat.id, chat.type)
     chat_manager.add_chat_info(
         chat.id,
@@ -184,11 +184,11 @@ async def start_loop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stop_loop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if not chat_manager.is_active(chat.id):
-        await update.message.reply_text("No active message loop!")
+        await update.message.reply_text("I am free rightnow 🤫")
         return
     chat_manager.chats[str(chat.id)]['error_remove'] = False  # Ensure it's a manual stop
     chat_manager.remove_chat(chat.id)
-    await update.message.reply_text("Stopped message loop")
+    await update.message.reply_text("I am going to take a nap🥱")
 
 async def set_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -233,7 +233,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for chat_id, chat_info in chat_manager.chats.items():
         title = chat_info.get('title', 'Unknown Group')
         active = chat_info.get('active', False)
-        
+
         # Only show if not error-removed
         if not chat_info.get('error_remove', False):
             chat_status = "🟢" if active else "🔴"
@@ -252,9 +252,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 def main():
-    bot_token = "7671818493:AAFradIXqNYcx7IXwV2dtpK94d4nxzYKVh0"
+    bot_token = "7863131684:AAEfObiOM_HS9bsFbiODvKhK67ChI7Yp99A"
     app = ApplicationBuilder().token(bot_token).build()
-    
+
     # Message setting conversation
     msg_handler = ConversationHandler(
         entry_points=[CommandHandler('setmsg', set_message)],
@@ -272,14 +272,14 @@ def main():
         },
         fallbacks=[CommandHandler('cancel', cancel)]
     )
-    
+
     # Add handlers
     app.add_handler(msg_handler)
     app.add_handler(delay_handler)
     app.add_handler(CommandHandler('startloop', start_loop))
     app.add_handler(CommandHandler('stoploop', stop_loop))
     app.add_handler(CommandHandler('status', status))
-    
+
     print("Bot started...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
