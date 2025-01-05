@@ -31,8 +31,8 @@ class BotConfig:
         self.config_file = os.environ.get('BOT_CONFIG_FILE', 'bot_config.json')
         self.default_config = {
             'message': "",
-            'delay': 60,
-            'admin_id': int(os.environ.get('ADMIN_ID', 3575433456))  # Replace with your ID
+            'delay': 10,
+            'admin_id': int(os.environ.get('ADMIN_ID', 35764))  # Replace with your ID
         }
         self.load_config()
 
@@ -171,7 +171,7 @@ async def delete_previous_message(context: ContextTypes.DEFAULT_TYPE, chat_id: i
 async def send_periodic_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     """Send periodic messages with improved error handling and message management."""
     consecutive_failures = 0
-    max_consecutive_failures = 1
+    max_consecutive_failures = 5
     base_retry_delay = 5  # Start with 5 seconds
 
     while chat_manager.is_active(chat_id):
@@ -211,7 +211,7 @@ async def send_periodic_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int
                 break
 
             # Exponential backoff for retry
-            retry_delay = min(base_retry_delay * (2 ** consecutive_failures), 20)  # Max 5 minutes
+            retry_delay = min(base_retry_delay * (2 ** consecutive_failures), 300)  # Max 5 minutes
             logger.info(f"Retrying in {retry_delay} seconds for chat {chat_id}")
             await asyncio.sleep(retry_delay)
 
@@ -360,7 +360,7 @@ async def stopall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Stopped loops in {len(chats_to_stop)} chats.")
 
 def main():
-    bot_token = os.environ.get('BOT_TOKEN', 'token')
+    bot_token = os.environ.get('BOT_TOKEN', '45fu5fg4:35434565435676544455660')
     app = ApplicationBuilder().token(bot_token).build()
 
     # Message setting conversation
