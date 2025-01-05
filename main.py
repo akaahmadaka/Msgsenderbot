@@ -11,7 +11,9 @@ from telegram.ext import (
 import asyncio
 import json
 import os
-from telegram.error import TelegramError, BadRequest
+from telegram.error import (
+    TelegramError, BadRequest, RetryAfter
+)
 
 # Enhanced logging
 logging.basicConfig(
@@ -22,15 +24,15 @@ logger = logging.getLogger(__name__)
 
 # States for conversation
 WAITING_FOR_MESSAGE = 1
-WAITING_FOR_DELAY = 1
+WAITING_FOR_DELAY = 2
 
 class BotConfig:
     def __init__(self):
-        self.config_file = 'bot_config.json'
+        self.config_file = os.environ.get('BOT_CONFIG_FILE', 'bot_config.json')
         self.default_config = {
             'message': "",
             'delay': 60,
-            'admin_id': 5250831809  # Replace with your ID
+            'admin_id': int(os.environ.get('ADMIN_ID', 3575433456))  # Replace with your ID
         }
         self.load_config()
 
@@ -77,7 +79,7 @@ class BotConfig:
 
 class ChatManager:
     def __init__(self):
-        self.data_file = 'active_chats.json'
+        self.data_file = os.environ.get('CHAT_DATA_FILE', 'active_chats.json')
         self.chats = {}
         self.last_messages = {}  # Store last message IDs
         self.load_chats()
@@ -106,29 +108,30 @@ class ChatManager:
             logger.error(f"Chat data save error: {e}")
 
     def add_chat(self, chat_id: int, chat_type: str):
-        if chat_type != Chat.PRIVATE:
-            self.chats[str(chat_id)] = {
+        chat_id_str = str(chat_id)
+        if chat_id_str not in self.chats and chat_type != Chat.PRIVATE:
+            self.chats[chat_id_str] = {
                 'type': chat_type,
                 'failed_attempts': 0,
                 'active': True,
-                'title': None
+                'title': None,
+                'task': None  # To store the task reference
             }
             self.save_chats()
 
     def add_chat_info(self, chat_id: int, title: str = None):
-        if str(chat_id) in self.chats:
-            self.chats[str(chat_id)]['title'] = title or "Unknown Group"
+        chat_id_str = str(chat_id)
+        if chat_id_str in self.chats:
+            self.chats[chat_id_str]['title'] = title or "Unknown Group"
             self.save_chats()
 
     def remove_chat(self, chat_id: int):
         chat_id_str = str(chat_id)
         if chat_id_str in self.chats:
-            if self.chats[chat_id_str].get('error_remove', False):
-                # Complete removal if error-based
-                self.chats.pop(chat_id_str, None)
-            else:
-                # Just mark inactive if manual stop
-                self.chats[chat_id_str]['active'] = False
+            task = self.chats[chat_id_str].get('task')
+            if task:
+                task.cancel()
+            del self.chats[chat_id_str]
             self.save_chats()
 
     def is_active(self, chat_id: int) -> bool:
@@ -147,6 +150,7 @@ config = BotConfig()
 chat_manager = ChatManager()
 
 def is_admin(user_id: int) -> bool:
+    """Check if the user is an admin."""
     return user_id == config.admin_id
 
 async def delete_previous_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
@@ -167,7 +171,7 @@ async def delete_previous_message(context: ContextTypes.DEFAULT_TYPE, chat_id: i
 async def send_periodic_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     """Send periodic messages with improved error handling and message management."""
     consecutive_failures = 0
-    max_consecutive_failures = 5
+    max_consecutive_failures = 1
     base_retry_delay = 5  # Start with 5 seconds
 
     while chat_manager.is_active(chat_id):
@@ -188,31 +192,36 @@ async def send_periodic_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int
         except TelegramError as e:
             consecutive_failures += 1
             logger.error(f"Telegram error in chat {chat_id}: {e}")
-            
-            if "bot was blocked" in str(e).lower() or "chat not found" in str(e).lower():
-                logger.error(f"Bot was blocked or chat not found in {chat_id}. Stopping loop.")
+
+            # Check if the bot is blocked, restricted, or the chat is not found
+            if (
+                "bot was blocked" in str(e).lower()
+                or "chat not found" in str(e).lower()
+                or "bot was kicked" in str(e).lower()
+                or "bot was deleted" in str(e).lower()
+                or "bot was restricted" in str(e).lower()
+            ):
+                logger.error(f"Bot was blocked, restricted, or chat not found in {chat_id}. Removing chat details.")
                 chat_manager.remove_chat(chat_id)
                 break
-                
+
             if consecutive_failures >= max_consecutive_failures:
                 logger.error(f"Too many consecutive failures in chat {chat_id}. Stopping loop.")
                 chat_manager.remove_chat(chat_id)
                 break
-                
+
             # Exponential backoff for retry
-            retry_delay = min(base_retry_delay * (2 ** consecutive_failures), 300)  # Max 5 minutes
+            retry_delay = min(base_retry_delay * (2 ** consecutive_failures), 20)  # Max 5 minutes
             logger.info(f"Retrying in {retry_delay} seconds for chat {chat_id}")
             await asyncio.sleep(retry_delay)
 
         except Exception as e:
             logger.error(f"Unexpected error in chat {chat_id}: {e}")
             consecutive_failures += 1
-            
             if consecutive_failures >= max_consecutive_failures:
                 logger.error(f"Too many consecutive failures in chat {chat_id}. Stopping loop.")
                 chat_manager.remove_chat(chat_id)
                 break
-            
             await asyncio.sleep(base_retry_delay)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -235,17 +244,15 @@ async def start_loop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if chat_manager.is_active(chat.id):
-        await update.message.reply_text("I am already getting filled 💦🥵")
+        # Remove the "I am already getting filled 💦🥵" message
         return
 
     try:
         chat_manager.add_chat(chat.id, chat.type)
-        chat_manager.add_chat_info(
-            chat.id,
-            title=chat.title or "Unknown Group"
-        )
-        asyncio.create_task(send_periodic_message(context, chat.id))
-        await update.message.reply_text("Loop started successfully!")
+        chat_manager.add_chat_info(chat.id, title=chat.title or "Unknown Group")
+        task = asyncio.create_task(send_periodic_message(context, chat.id))
+        chat_manager.chats[str(chat.id)]['task'] = task
+        # Remove the "Loop started successfully!" message
         logger.info(f"Loop started successfully in chat {chat.id}")
     except Exception as e:
         logger.error(f"Error starting loop in chat {chat.id}: {e}")
@@ -254,11 +261,14 @@ async def start_loop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stop_loop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if not chat_manager.is_active(chat.id):
-        await update.message.reply_text("I am free rightnow 🤫")
+        await update.message.reply_text("I am free rightnow 🥱")
         return
-    chat_manager.chats[str(chat.id)]['error_remove'] = False  # Ensure it's a manual stop
+    chat_manager.chats[str(chat.id)]['active'] = False
+    task = chat_manager.chats[str(chat.id)].get('task')
+    if task:
+        task.cancel()
     chat_manager.remove_chat(chat.id)
-    await update.message.reply_text("I am going to take a nap🥱")
+    await update.message.reply_text("I am going to take a nap 🥱")
 
 async def set_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -303,12 +313,11 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for chat_id, chat_info in chat_manager.chats.items():
         title = chat_info.get('title', 'Unknown Group')
         active = chat_info.get('active', False)
-
-        # Only show if not error-removed
-        if not chat_info.get('error_remove', False):
-            chat_status = "🟢" if active else "🔴"
-            chat_text = f"{chat_status} {title}"
-            group_chats.append(chat_text)
+        task = chat_info.get('task', None)
+        task_status = "Running" if task and not task.done() else "Stopped"
+        chat_status = "🟢" if active else "🔴"
+        chat_text = f"{chat_status} {title} - {task_status}"
+        group_chats.append(chat_text)
 
     if group_chats:
         status_message += "\n".join(group_chats)
@@ -321,8 +330,37 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Operation cancelled")
     return ConversationHandler.END
 
+async def startall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id) or update.effective_chat.type != Chat.PRIVATE:
+        await update.message.reply_text("Admin only command in private chat!")
+        return
+    chats_to_start = [chat_id for chat_id, chat_info in chat_manager.chats.items() if not chat_info['active']]
+    if not chats_to_start:
+        await update.message.reply_text("No chats to start.")
+        return
+    for chat_id in chats_to_start:
+        chat_manager.chats[str(chat_id)]['active'] = True
+        task = asyncio.create_task(send_periodic_message(context, int(chat_id)))
+        chat_manager.chats[str(chat_id)]['task'] = task
+    await update.message.reply_text(f"Started loops in {len(chats_to_start)} chats.")
+
+async def stopall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id) or update.effective_chat.type != Chat.PRIVATE:
+        await update.message.reply_text("Admin only command in private chat!")
+        return
+    chats_to_stop = [chat_id for chat_id, chat_info in chat_manager.chats.items() if chat_info['active']]
+    if not chats_to_stop:
+        await update.message.reply_text("No chats to stop.")
+        return
+    for chat_id in chats_to_stop:
+        chat_manager.chats[str(chat_id)]['active'] = False
+        task = chat_manager.chats[str(chat_id)].get('task')
+        if task:
+            task.cancel()
+    await update.message.reply_text(f"Stopped loops in {len(chats_to_stop)} chats.")
+
 def main():
-    bot_token = "7671818493:AAFradIXqNYcx7IXwV2dtpK94d4nxzYKVh0"
+    bot_token = os.environ.get('BOT_TOKEN', 'token')
     app = ApplicationBuilder().token(bot_token).build()
 
     # Message setting conversation
@@ -348,6 +386,8 @@ def main():
     app.add_handler(CommandHandler('startloop', start_loop))
     app.add_handler(CommandHandler('stoploop', stop_loop))
     app.add_handler(CommandHandler('status', status))
+    app.add_handler(CommandHandler('startall', startall))
+    app.add_handler(CommandHandler('stopall', stopall))
     app.add_handler(msg_handler)
     app.add_handler(delay_handler)
 
