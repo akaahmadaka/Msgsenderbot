@@ -1,5 +1,6 @@
 # handlers.py
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 from utils import (
     load_data, add_group, get_global_settings, 
@@ -157,11 +158,15 @@ async def setdelay(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
+        # Check admin permission
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ Admin only command!")
+            return
+
         data = load_data()
-        settings = get_global_settings()
         
         # Count active groups
-        active_count = sum(1 for group in data["groups"].values() if group["active"])
+        active_count = sum(1 for group in data["groups"].values() if group.get("active", False))
         total_count = len(data["groups"])
 
         # Create status message with emojis and formatting
@@ -171,11 +176,12 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "*Active Groups:*\n"
         )
 
-        # Add active groups with emojis
+        # Add active groups with emojis - safely get group name
         active_groups = []
         for group_id, group in data["groups"].items():
-            if group["active"]:
-                active_groups.append(f"🟢 {group['title']}")
+            if group.get("active", False):
+                group_name = group.get("name", "Unknown Group")  # Safely get group name
+                active_groups.append(f"🟢 {group_name}")
             
         if active_groups:
             status_msg += "\n".join(active_groups)
@@ -184,7 +190,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(
             status_msg,
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode='Markdown'  # Using string instead of ParseMode
         )
 
     except Exception as e:
@@ -202,4 +208,4 @@ def get_handlers():
         CommandHandler("setmsg", setmsg),
         CommandHandler("setdelay", setdelay),
         CommandHandler("status", status)
-            ]
+        ]
