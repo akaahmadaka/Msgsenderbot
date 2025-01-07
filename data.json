@@ -1,0 +1,24 @@
+{
+    "global_settings": {
+        "message": "testqqww",
+        "delay": 10,
+        "last_updated": "2025-01-07T18:39:06.281188+00:00"
+    },
+    "groups": {
+        "-1002450995503": {
+            "name": "Testing",
+            "loop_running": false,
+            "last_message_id": 450,
+            "next_run_time": null,
+            "last_run": "2025-01-07T18:44:46.153641+00:00",
+            "next_run": "2025-01-07T18:44:56.153592+00:00",
+            "last_updated": "2025-01-07T18:43:48.665804+00:00",
+            "retry_count": 0,
+            "manually_stopped": true,
+            "error_count": 0,
+            "last_start": "2025-01-07T18:43:48.670542+00:00",
+            "stop_time": "2025-01-07T18:34:23.346240+00:00",
+            "error_time": "2025-01-07T18:44:56.734031+00:00"
+        }
+    }
+}
