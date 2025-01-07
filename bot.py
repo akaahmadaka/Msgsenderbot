@@ -6,7 +6,7 @@ import sys
 import os
 from datetime import datetime
 from telegram.ext import Application, CommandHandler
-from handlers import startloop, stoploop, setmsg, setdelay
+from handlers import startloop, stoploop, setmsg, setdelay, status
 from scheduler import start_scheduler, stop_scheduler
 from config import BOT_TOKEN
 
@@ -41,6 +41,7 @@ class Bot:
             self.app.add_handler(CommandHandler("stoploop", stoploop))
             self.app.add_handler(CommandHandler("setmsg", setmsg))
             self.app.add_handler(CommandHandler("setdelay", setdelay))
+            self.app.add_handler(CommandHandler("status", status))
             
             # Error handler
             self.app.add_error_handler(self.error_handler)
