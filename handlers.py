@@ -216,4 +216,4 @@ def get_handlers():
         CommandHandler("setmsg", setmsg),
         CommandHandler("setdelay", setdelay),
         CommandHandler("status", status)
-            ]
+        ]
