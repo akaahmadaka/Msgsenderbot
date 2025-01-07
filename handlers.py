@@ -1,7 +1,7 @@
 # handlers.py
 from telegram import Update
 from telegram.ext import ContextTypes, CommandHandler
-from utils import load_data, save_data, add_group, get_global_settings, update_global_settings
+from utils import load_data, save_data, add_group, get_global_settings, update_global_settings, remove_group
 from scheduler import schedule_message, remove_scheduled_job, is_running
 import logging
 from datetime import datetime, timezone, timedelta
@@ -13,6 +13,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Define admin IDs (replace with actual admin IDs)
+ADMIN_IDS = [5250831809]  # Add your admin ID here
+
+def is_admin(user_id: int) -> bool:
+    """Check if user is an admin."""
+    return user_id in ADMIN_IDS
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command."""
     welcome_message = (
@@ -20,9 +27,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Available commands:\n"
         "/startloop - Start message loop in a group\n"
         "/stoploop - Stop message loop in a group\n"
-        "/setmsg <message> - Set global message (private chat only)\n"
-        "/setdelay <seconds> - Set global delay (private chat only, minimum 60s)\n"
-        "/status - Check current settings and status"
+        "/setmsg <message> - Set global message (admin only)\n"
+        "/setdelay <seconds> - Set global delay (admin only)\n"
+        "/status - Check current settings and status (admin only)"
     )
     await update.message.reply_text(welcome_message)
 
@@ -50,6 +57,8 @@ async def startloop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Start the message loop
         data = load_data()
         data["groups"][group_id]["loop_running"] = True
+        data["groups"][group_id]["error_count"] = 0  # Reset error count
+        data["groups"][group_id]["last_start"] = datetime.now(timezone.utc).isoformat()
         save_data(data)
         
         success = await schedule_message(
@@ -73,16 +82,6 @@ async def startloop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error in startloop for group {group_id}: {e}")
         await update.message.reply_text("❌ An error occurred while starting the loop.")
-        
-        # Cleanup on error
-        try:
-            data = load_data()
-            if group_id in data["groups"]:
-                data["groups"][group_id]["loop_running"] = False
-                save_data(data)
-            await remove_scheduled_job(group_id)
-        except Exception as cleanup_error:
-            logger.error(f"Error during cleanup: {cleanup_error}")
 
 async def stoploop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /stoploop command."""
@@ -93,20 +92,10 @@ async def stoploop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         group_id = str(update.message.chat_id)
 
-        # Check if loop is actually running
-        if not is_running(group_id):
-            await update.message.reply_text("ℹ️ No active loop to stop.")
-            # Ensure data file is in sync
-            data = load_data()
-            if group_id in data["groups"]:
-                data["groups"][group_id]["loop_running"] = False
-                save_data(data)
-            return
-
-        # Stop the message loop
         data = load_data()
         if group_id in data["groups"]:
             data["groups"][group_id]["loop_running"] = False
+            data["groups"][group_id]["stop_time"] = datetime.now(timezone.utc).isoformat()
             save_data(data)
             await remove_scheduled_job(group_id)
             await update.message.reply_text("✅ Message loop stopped!")
@@ -118,10 +107,11 @@ async def stoploop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ An error occurred while stopping the loop.")
 
 async def setmsg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /setmsg command (private chat only)."""
+    """Handle /setmsg command (admin only)."""
     try:
-        if update.message.chat.type != "private":
-            await update.message.reply_text("❌ This command is only available in private chat.")
+        # Check if user is admin
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ This command is only available to administrators.")
             return
 
         if not context.args:
@@ -167,20 +157,21 @@ async def setmsg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Failed to update message.")
 
 async def setdelay(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /setdelay command (private chat only)."""
+    """Handle /setdelay command (admin only)."""
     try:
-        if update.message.chat.type != "private":
-            await update.message.reply_text("❌ This command is only available in private chat.")
+        # Check if user is admin
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ This command is only available to administrators.")
             return
 
         if not context.args:
-            await update.message.reply_text("❌ Please provide a delay in seconds (minimum 60).")
+            await update.message.reply_text("❌ Please provide a delay in seconds (minimum 10).")
             return
 
         try:
             new_delay = int(context.args[0])
-            if new_delay < 60:
-                await update.message.reply_text("❌ Delay must be at least 60 seconds.")
+            if new_delay < 10:
+                await update.message.reply_text("❌ Delay must be at least 10 seconds.")
                 return
         except ValueError:
             await update.message.reply_text("❌ Please provide a valid number for delay.")
@@ -223,22 +214,78 @@ async def setdelay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Failed to update delay.")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /status command."""
+    """Handle /status command (admin only)."""
     try:
+        # Check if user is admin
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ This command is only available to administrators.")
+            return
+
         settings = get_global_settings()
         data = load_data()
+        current_time = datetime.now(timezone.utc)
         
-        active_groups = sum(1 for group_id in data["groups"] if is_running(str(group_id)))
-        total_groups = len(data["groups"])
+        # Process groups and remove inactive ones
+        active_groups = []
+        inactive_groups = []
+        groups_to_remove = []
+
+        for group_id, group_data in data["groups"].items():
+            # Check for groups with too many errors
+            error_count = group_data.get("error_count", 0)
+            if error_count >= 5:  # Maximum error threshold
+                groups_to_remove.append(group_id)
+                continue
+
+            group_name = group_data.get("name", "Unknown Group")
+            is_active = group_data.get("loop_running", False) and is_running(group_id)
+            next_run = group_data.get("next_run")
+            
+            if next_run:
+                try:
+                    next_run_time = datetime.fromisoformat(next_run)
+                    time_until_next = next_run_time - current_time
+                    next_run_str = f"Next: {time_until_next.total_seconds():.0f}s"
+                except (ValueError, TypeError):
+                    next_run_str = "Next: Unknown"
+            else:
+                next_run_str = "Not scheduled"
+
+            group_info = f"{group_name} ({group_id}) - {next_run_str}"
+            
+            if is_active:
+                active_groups.append(f"🟢 {group_info}")
+            else:
+                inactive_groups.append(f"🔴 {group_info}")
+
+        # Remove groups with too many errors
+        for group_id in groups_to_remove:
+            remove_group(group_id)
+            logger.info(f"Removed group {group_id} due to excessive errors")
+
+        # Current UTC time
+        current_time_str = current_time.strftime("%Y-%m-%d %H:%M:%S UTC")
         
         status_message = (
-            "📊 Current Status:\n\n"
-            f"Message: {settings['message']}\n"
-            f"Delay: {settings['delay']} seconds\n"
-            f"Active Groups: {active_groups}/{total_groups}"
+            f"📊 Bot Status Report\n"
+            f"Time: {current_time_str}\n\n"
+            f"Global Settings:\n"
+            f"- Message: {settings['message']}\n"
+            f"- Delay: {settings['delay']} seconds\n\n"
+            f"Groups Summary:\n"
+            f"- Total Groups: {len(data['groups'])}\n"
+            f"- Active: {len(active_groups)}\n"
+            f"- Inactive: {len(inactive_groups)}\n\n"
         )
+
+        if active_groups:
+            status_message += "Active Groups:\n" + "\n".join(active_groups) + "\n\n"
         
+        if inactive_groups:
+            status_message += "Inactive Groups:\n" + "\n".join(inactive_groups)
+
         await update.message.reply_text(status_message)
+        
     except Exception as e:
         logger.error(f"Error in status command: {e}")
         await update.message.reply_text("❌ Failed to get status.")
@@ -252,4 +299,4 @@ def get_handlers():
         CommandHandler("setmsg", setmsg),
         CommandHandler("setdelay", setdelay),
         CommandHandler("status", status),
-    ]
+        ]
