@@ -156,53 +156,39 @@ async def setdelay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Failed to update delay")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show bot status (Admin only)."""
     try:
-        # Check admin permission
-        if not is_admin(update.effective_user.id):
-            await update.message.reply_text("❌ Admin only command!")
-            return
-
         data = load_data()
         settings = get_global_settings()
-        active_count = get_active_tasks_count()
+        
+        # Count active groups
+        active_count = sum(1 for group in data["groups"].values() if group["active"])
+        total_count = len(data["groups"])
 
-        # Process groups
-        active_groups = []
-        inactive_groups = []
-
-        for group_id, group_data in data["groups"].items():
-            group_name = group_data["name"]
-            next_schedule = group_data.get("next_schedule", "Not scheduled")
-            
-            group_info = f"{group_name} ({group_id}) - Next: {next_schedule}"
-            
-            if group_data["active"] and is_running(group_id):
-                active_groups.append(f"🟢 {group_info}")
-            else:
-                inactive_groups.append(f"🔴 {group_info}")
-
-        # Build status message
-        status_message = (
-            f"📊 Bot Status\n\n"
-            f"Settings:\n"
-            f"- Message: {settings['message']}\n"
-            f"- Delay: {settings['delay']} seconds\n\n"
-            f"Groups Summary:\n"
-            f"- Total Groups: {len(data['groups'])}\n"
-            f"- Active Groups: {active_count}\n\n"
+        # Create status message with emojis and formatting
+        status_msg = (
+            "📊 *Bot Status*\n\n"
+            f"📈 Groups: {total_count} │ Active: {active_count}\n\n"
+            "*Active Groups:*\n"
         )
 
+        # Add active groups with emojis
+        active_groups = []
+        for group_id, group in data["groups"].items():
+            if group["active"]:
+                active_groups.append(f"🟢 {group['title']}")
+            
         if active_groups:
-            status_message += "Active Groups:\n" + "\n".join(active_groups) + "\n\n"
-        
-        if inactive_groups:
-            status_message += "Inactive Groups:\n" + "\n".join(inactive_groups)
+            status_msg += "\n".join(active_groups)
+        else:
+            status_msg += "❌ No active groups"
 
-        await update.message.reply_text(status_message)
+        await update.message.reply_text(
+            status_msg,
+            parse_mode=ParseMode.MARKDOWN
+        )
 
     except Exception as e:
-        logger.error(f"Error in status: {e}")
+        logger.error(f"Status command failed - {str(e)}")
         await update.message.reply_text("❌ Failed to get status")
 
 def get_handlers():
@@ -216,4 +202,4 @@ def get_handlers():
         CommandHandler("setmsg", setmsg),
         CommandHandler("setdelay", setdelay),
         CommandHandler("status", status)
-    ]
+            ]
