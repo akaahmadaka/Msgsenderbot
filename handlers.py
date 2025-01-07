@@ -4,7 +4,8 @@ from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 from utils import (
     load_data, add_group, get_global_settings, 
-    update_global_settings, remove_group
+    update_global_settings,
+update_group_status, remove_group
 )
 from scheduler import (
     schedule_message, remove_scheduled_job, 
@@ -90,12 +91,26 @@ async def stoploop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         group_id = str(update.message.chat_id)
         
+        # Load data and check if group exists
+        data = load_data()
+        if group_id not in data["groups"]:
+            logger.info(f"Stop command failed - Group {group_id} not found in database")
+            await update.message.reply_text("❌ No active loop found!")
+            return
+
+        # Update group status to inactive
+        update_group_status(group_id, False)
+        logger.info(f"Group {group_id} status updated to inactive")
+
         # Stop the loop
         await remove_scheduled_job(group_id)
+        logger.info(f"Message loop stopped for group {group_id}")
+
+        # Send confirmation
         await update.message.reply_text("✅ Message loop stopped!")
 
     except Exception as e:
-        logger.error(f"Error in stoploop: {e}")
+        logger.error(f"Stop command failed - {str(e)}")
         await update.message.reply_text("❌ Failed to stop message loop")
 
 async def setmsg(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -208,4 +223,4 @@ def get_handlers():
         CommandHandler("setmsg", setmsg),
         CommandHandler("setdelay", setdelay),
         CommandHandler("status", status)
-        ]
+            ]
