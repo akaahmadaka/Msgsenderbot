@@ -1,0 +1,16 @@
+{
+    "global_settings": {
+        "message": "Default message",
+        "delay": 3600
+    },
+    "groups": {
+        "-1002450995503": {
+            "name": "Testing",
+            "last_msg_id": 627,
+            "next_schedule": "17:27:35",
+            "active": true,
+            "error_count": 0,
+            "error_state": false
+        }
+    }
+}
