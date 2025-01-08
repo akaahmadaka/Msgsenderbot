@@ -4,8 +4,7 @@ from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 from utils import (
     load_data, add_group, get_global_settings, 
-    update_global_settings,
-update_group_status, remove_group
+    update_global_settings, update_group_status, remove_group
 )
 from scheduler import (
     schedule_message, remove_scheduled_job, 
@@ -29,15 +28,24 @@ def is_admin(user_id: int) -> bool:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command."""
-    welcome_message = (
+    is_admin_user = is_admin(update.effective_user.id)
+    
+    base_commands = (
         "👋 Welcome to Message Loop Bot!\n\n"
         "Available Commands:\n"
         "/startloop - Start message loop in group\n"
         "/stoploop - Stop message loop in group\n"
+    )
+    
+    admin_commands = (
         "/setmsg <message> - Set message (Admin)\n"
         "/setdelay <seconds> - Set delay (Admin)\n"
-        "/status - Check bot status (Admin)"
+        "/status - Check bot status (Admin)\n"
+        "/startall - Start all stopped groups (Admin, private)\n"
+        "/stopall - Stop all running groups (Admin, private)"
     )
+    
+    welcome_message = base_commands + (admin_commands if is_admin_user else "")
     await update.message.reply_text(welcome_message)
 
 async def startloop(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -171,7 +179,84 @@ async def setdelay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error in setdelay: {e}")
         await update.message.reply_text("❌ Failed to update delay")
 
+async def startall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start message loop in all manually stopped groups (Admin only)."""
+    try:
+        # Check admin permission and private chat
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ Admin only command!")
+            return
+            
+        if update.message.chat.type != "private":
+            await update.message.reply_text("❌ This command only works in private chat!")
+            return
+
+        data = load_data()
+        settings = get_global_settings()
+        started_count = 0
+        
+        # Get list of manually stopped groups
+        for group_id, group in data["groups"].items():
+            if not group.get("active", False) and not group.get("error_state", False):
+                success = await schedule_message(
+                    context.bot,
+                    group_id,
+                    message=settings["message"],
+                    delay=settings["delay"]
+                )
+                if success:
+                    started_count += 1
+                    logger.info(f"Restarted loop in group {group['name']}")
+
+        if started_count > 0:
+            await update.message.reply_text(
+                f"✅ Successfully started message loop in {started_count} groups!"
+            )
+        else:
+            await update.message.reply_text("ℹ️ No manually stopped groups found")
+
+    except Exception as e:
+        logger.error(f"Start all command failed - {str(e)}")
+        await update.message.reply_text("❌ Failed to start groups")
+
+async def stopall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stop message loop in all manually started groups (Admin only)."""
+    try:
+        # Check admin permission and private chat
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("❌ Admin only command!")
+            return
+            
+        if update.message.chat.type != "private":
+            await update.message.reply_text("❌ This command only works in private chat!")
+            return
+
+        data = load_data()
+        stopped_count = 0
+        
+        # Get list of manually started groups
+        for group_id, group in data["groups"].items():
+            if group.get("active", False):
+                # Update group status to inactive
+                update_group_status(group_id, False)
+                # Stop the loop
+                await remove_scheduled_job(group_id)
+                stopped_count += 1
+                logger.info(f"Stopped loop in group {group['name']}")
+
+        if stopped_count > 0:
+            await update.message.reply_text(
+                f"✅ Successfully stopped message loop in {stopped_count} groups!"
+            )
+        else:
+            await update.message.reply_text("ℹ️ No active groups found")
+
+    except Exception as e:
+        logger.error(f"Stop all command failed - {str(e)}")
+        await update.message.reply_text("❌ Failed to stop groups")
+
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show bot status (Admin only)."""
     try:
         # Check admin permission
         if not is_admin(update.effective_user.id):
@@ -232,5 +317,7 @@ def get_handlers():
         CommandHandler("stoploop", stoploop),
         CommandHandler("setmsg", setmsg),
         CommandHandler("setdelay", setdelay),
-        CommandHandler("status", status)
-    ]
+        CommandHandler("status", status),
+        CommandHandler("startall", startall),
+        CommandHandler("stopall", stopall)
+        ]
