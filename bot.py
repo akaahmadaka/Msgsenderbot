@@ -3,8 +3,12 @@ import asyncio
 import signal
 import sys
 import logging
-from telegram.ext import Application, CommandHandler
-from handlers import start, startloop, stoploop, setmsg, setdelay, startall, stopall, status
+from telegram.ext import Application, CommandHandler, filters
+from handlers import (
+    start, startloop, stoploop, 
+    setmsg, setdelay, status,
+    startall, stopall
+)
 from scheduler import start_scheduler, stop_scheduler
 from config import BOT_TOKEN
 
@@ -41,21 +45,26 @@ class Bot:
     def setup_handlers(self):
         """Setup command handlers"""
         try:
+            # Define handlers with their filters
             handlers = [
-                ("start", start),
-                ("startloop", startloop),
-                ("stoploop", stoploop),
-                ("setmsg", setmsg),
-                ("setdelay", setdelay),
-                ("status", status),
-                ("startall", startall),
-                ("stopall", stopall)
+                # Start command only responds in private or with deep link
+                ("start", start, filters.ChatType.PRIVATE | (filters.ChatType.GROUPS & filters.Regex(r"startloop"))),
+                ("startloop", startloop, None),
+                ("stoploop", stoploop, None),
+                ("setmsg", setmsg, None),
+                ("setdelay", setdelay, None),
+                ("status", status, None),
+                ("startall", startall, filters.ChatType.PRIVATE),  # Admin commands in private only
+                ("stopall", stopall, filters.ChatType.PRIVATE)     # Admin commands in private only
             ]
             
-            for command, handler in handlers:
-                self.app.add_handler(CommandHandler(command, handler))
+            # Register each handler with its specific filter
+            for command, callback, filter_type in handlers:
+                handler = CommandHandler(command, callback, filters=filter_type) if filter_type else CommandHandler(command, callback)
+                self.app.add_handler(handler)
                 
             self.app.add_error_handler(self.error_handler)
+            logger.info("Handlers setup completed successfully")
         except Exception as e:
             logger.error(f"Handler setup failed: {e}")
             raise
@@ -69,17 +78,20 @@ class Bot:
     async def start(self):
         """Start bot"""
         try:
+            # Initialize scheduler
             await start_scheduler()
             await self.app.initialize()
             await self.app.start()
             
             self.is_running = True
+            
+            # Start polling with specific updates
             await self.app.updater.start_polling(
-                allowed_updates=["message"],
+                allowed_updates=["message", "callback_query"],
                 drop_pending_updates=True
             )
             
-            logger.info("Bot running")
+            logger.info("Bot started successfully")
             
             # Keep bot alive
             while self.is_running:
@@ -96,19 +108,21 @@ class Bot:
         try:
             self.is_running = False
             
+            # Stop scheduler
             await stop_scheduler()
             
+            # Stop bot components
             if self.app.updater and self.app.updater.running:
                 await self.app.updater.stop()
             await self.app.stop()
             await self.app.shutdown()
             
-            logger.info("Bot stopped")
+            logger.info("Bot stopped successfully")
         except Exception as e:
             logger.error(f"Stop failed: {e}")
 
 def setup_signal_handlers(bot):
-    """Setup signal handlers"""
+    """Setup signal handlers for graceful shutdown"""
     def signal_handler(signum, frame):
         bot.is_running = False
 
@@ -123,6 +137,7 @@ async def main():
         setup_signal_handlers(bot)
         await bot.start()
     except (KeyboardInterrupt, SystemExit):
+        logger.info("Received shutdown signal")
         pass
     except Exception as e:
         logger.error(f"Fatal error: {e}")
