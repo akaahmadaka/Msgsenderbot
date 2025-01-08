@@ -1,13 +1,19 @@
-# bot.py11
+# bot.py
 import asyncio
 import signal
 import sys
 import logging
-from telegram.ext import Application, CommandHandler, filters
+from telegram.ext import (
+    Application, CommandHandler, filters,
+    ConversationHandler, MessageHandler
+)
 from handlers import (
     start, startloop, stoploop, 
     setmsg, setdelay, status,
-    startall, stopall
+    startall, stopall,
+    # New imports for conversation handler
+    receive_new_message, cancel,
+    WAITING_FOR_MESSAGE
 )
 from scheduler import start_scheduler, stop_scheduler
 from config import BOT_TOKEN
@@ -45,13 +51,28 @@ class Bot:
     def setup_handlers(self):
         """Setup command handlers"""
         try:
-            # Define handlers with their filters
+            # Create conversation handler for setmsg
+            setmsg_conv_handler = ConversationHandler(
+                entry_points=[CommandHandler("setmsg", setmsg)],
+                states={
+                    WAITING_FOR_MESSAGE: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, receive_new_message)
+                    ],
+                },
+                fallbacks=[CommandHandler("cancel", cancel)],
+                allow_reentry=True,
+                conversation_timeout=300  # Timeout after 5 minutes
+            )
+            
+            # Add conversation handler first
+            self.app.add_handler(setmsg_conv_handler)
+            
+            # Define other handlers with their filters
             handlers = [
                 # Start command only responds in private or with deep link
                 ("start", start, filters.ChatType.PRIVATE | (filters.ChatType.GROUPS & filters.Regex(r"startloop"))),
                 ("startloop", startloop, None),
                 ("stoploop", stoploop, None),
-                ("setmsg", setmsg, None),
                 ("setdelay", setdelay, None),
                 ("status", status, None),
                 ("startall", startall, filters.ChatType.PRIVATE),  # Admin commands in private only

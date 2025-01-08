@@ -1,7 +1,7 @@
 # handlers.py
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import ContextTypes, CommandHandler, filters
+from telegram.ext import ContextTypes, CommandHandler, ConversationHandler, filters
 from utils import (
     load_data, add_group, get_global_settings, 
     update_global_settings, update_group_status, remove_group
@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 # Admin configuration
 ADMIN_IDS = [5250831809]  # Add admin IDs here
+WAITING_FOR_MESSAGE = 1
 
 def is_admin(user_id: int) -> bool:
     """Check if user is an admin."""
@@ -117,29 +118,54 @@ async def stoploop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Failed to stop message loop")
 
 async def setmsg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set global message (Admin only)."""
+    """Start the setmsg conversation (Admin only)."""
     try:
         # Check admin permission
         if not is_admin(update.effective_user.id):
             await update.message.reply_text("❌ Admin only command!")
-            return
+            return ConversationHandler.END
 
-        # Check message content
-        if not context.args:
-            await update.message.reply_text("❌ Please provide a message!")
-            return
+        # Check if in private chat
+        if update.message.chat.type != "private":
+            await update.message.reply_text("❌ This command only works in private chat!")
+            return ConversationHandler.END
 
-        new_message = " ".join(context.args)
+        await update.message.reply_text(
+            "📝 Please send the new message you want to set:"
+        )
+        return WAITING_FOR_MESSAGE
+
+    except Exception as e:
+        logger.error(f"Error in setmsg: {e}")
+        await update.message.reply_text("❌ Failed to start message update")
+        return ConversationHandler.END
+
+# Add new handler functions
+async def receive_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the received message for setmsg."""
+    try:
+        # Check admin permission again for safety
+        if not is_admin(update.effective_user.id):
+            return ConversationHandler.END
+
+        new_message = update.message.text
         settings = update_global_settings(message=new_message)
         
         await update.message.reply_text(
             f"✅ Global message updated!\n"
             f"New message: {settings['message']}"
         )
+        return ConversationHandler.END
 
     except Exception as e:
-        logger.error(f"Error in setmsg: {e}")
+        logger.error(f"Error updating message: {e}")
         await update.message.reply_text("❌ Failed to update message")
+        return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel the conversation."""
+    await update.message.reply_text("❌ Message update cancelled.")
+    return ConversationHandler.END
 
 async def setdelay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Set global delay (Admin only)."""
