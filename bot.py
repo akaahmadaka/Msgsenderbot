@@ -3,11 +3,11 @@ import asyncio
 import signal
 import sys
 import logging
-from telegram.ext import Application, CommandHandler, filters
+from telegram.ext import Application, CommandHandler, filters, ConversationHandler, MessageHandler
 from handlers import (
     start, startloop, stoploop, 
     setmsg, setdelay, status,
-    startall, stopall
+    startall, stopall, WAITING_FOR_MESSAGE, receive_new_message, cancel
 )
 from scheduler import start_scheduler, stop_scheduler, scheduler
 from config import BOT_TOKEN
@@ -46,20 +46,32 @@ class Bot:
     def setup_handlers(self):
         """Setup command handlers"""
         try:
-            # Define handlers with their filters
+            # Create conversation handler for setmsg
+            conv_handler = ConversationHandler(
+                entry_points=[CommandHandler("setmsg", setmsg)],
+                states={
+                    WAITING_FOR_MESSAGE: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, receive_new_message)
+                    ],
+                },
+                fallbacks=[CommandHandler("cancel", cancel)],
+            )
+            
+            # Define regular handlers with their filters
             handlers = [
-                # Start command only responds in private or with deep link
                 ("start", start, filters.ChatType.PRIVATE | (filters.ChatType.GROUPS & filters.Regex(r"startloop"))),
                 ("startloop", startloop, None),
                 ("stoploop", stoploop, None),
-                ("setmsg", setmsg, None),
                 ("setdelay", setdelay, None),
                 ("status", status, None),
-                ("startall", startall, filters.ChatType.PRIVATE),  # Admin commands in private only
-                ("stopall", stopall, filters.ChatType.PRIVATE)     # Admin commands in private only
+                ("startall", startall, filters.ChatType.PRIVATE),
+                ("stopall", stopall, filters.ChatType.PRIVATE)
             ]
             
-            # Register each handler with its specific filter
+            # Add conversation handler first
+            self.app.add_handler(conv_handler)
+            
+            # Register other handlers
             for command, callback, filter_type in handlers:
                 handler = CommandHandler(command, callback, filters=filter_type) if filter_type else CommandHandler(command, callback)
                 self.app.add_handler(handler)

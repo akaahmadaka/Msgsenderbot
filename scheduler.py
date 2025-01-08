@@ -238,12 +238,12 @@ class MessageScheduler:
         """Update all running tasks with new settings."""
         try:
             data = load_data()
-            settings = get_global_settings()
+            settings = get_global_settings()  # Get latest settings
             current_time = datetime.now(pytz.UTC)
+            updated_count = 0
             
             # Store current tasks
             current_tasks = self.tasks.copy()
-            updated_count = 0
             
             # Cancel and recreate each running task with new settings
             for group_id, task in current_tasks.items():
@@ -251,23 +251,20 @@ class MessageScheduler:
                     # Cancel current task
                     await self.remove_scheduled_job(group_id)
                     
-                    # Get current settings with updates
-                    msg = new_message if new_message is not None else settings["message"]
-                    delay = new_delay if new_delay is not None else settings["delay"]
-                    
-                    # Calculate new next schedule
-                    next_time = current_time + timedelta(seconds=delay)
-                    update_group_message(group_id, data["groups"][group_id].get("last_msg_id"), next_time)
-                    
-                    # Create new task
+                    # Create new task with updated settings
                     self.tasks[group_id] = asyncio.create_task(
                         self._message_loop(
                             bot,
                             group_id,
-                            msg,
-                            delay
+                            new_message or settings["message"],
+                            new_delay or settings["delay"]
                         )
                     )
+                    
+                    # Update next schedule
+                    next_time = current_time + timedelta(seconds=(new_delay or settings["delay"]))
+                    update_group_message(group_id, data["groups"][group_id].get("last_msg_id"), next_time)
+                    
                     updated_count += 1
                     logger.info(f"Updated task for group {group_id} with new settings")
             

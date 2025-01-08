@@ -193,15 +193,12 @@ async def setdelay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Please provide a valid number!")
             return
 
-        # Update global settings
+        # First update global settings
         settings = update_global_settings(delay=new_delay)
         
-        # Update running tasks with new delay
+        # Then update running tasks
         from scheduler import scheduler
-        updated_count = await scheduler.update_running_tasks(
-            context.bot,
-            new_delay=new_delay
-        )
+        updated_count = await scheduler.update_running_tasks(context.bot, new_delay=new_delay)
         
         await update.message.reply_text(
             f"✅ Global delay updated!\n"
@@ -222,14 +219,13 @@ async def receive_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             return ConversationHandler.END
 
         new_message = update.message.text
+        
+        # Update global settings first
         settings = update_global_settings(message=new_message)
         
-        # Update running tasks with new message
+        # Then update running tasks
         from scheduler import scheduler
-        updated_count = await scheduler.update_running_tasks(
-            context.bot,
-            new_message=new_message
-        )
+        updated_count = await scheduler.update_running_tasks(context.bot, new_message=new_message)
         
         await update.message.reply_text(
             f"✅ Global message updated!\n"
