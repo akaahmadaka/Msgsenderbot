@@ -67,7 +67,13 @@ class MessageScheduler:
 
                 try:
                     async with asyncio.timeout(30):
-                        # Try to delete previous message if exists
+                        # First try to send new message
+                        sent_message = await bot.send_message(
+                            chat_id=int(group_id), 
+                            text=message
+                        )
+                        
+                        # If message was sent successfully, then try to delete the previous message
                         last_msg_id = data["groups"][group_id].get("last_msg_id")
                         if last_msg_id:
                             try:
@@ -77,12 +83,6 @@ class MessageScheduler:
                                 )
                             except Exception as del_err:
                                 logger.warning(f"Could not delete previous message in {group_id}: {del_err}")
-
-                        # Send new message
-                        sent_message = await bot.send_message(
-                            chat_id=int(group_id), 
-                            text=message
-                        )
                         
                         # Calculate next schedule time
                         next_time = datetime.now() + timedelta(seconds=delay)
