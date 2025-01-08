@@ -56,8 +56,8 @@ class MessageScheduler:
             
             await self.remove_scheduled_job(group_id)
             
-            # Calculate initial next schedule
-            next_time = datetime.now(pytz.UTC) + timedelta(seconds=delay)
+            # Set initial next schedule to current time so first message sends immediately
+            next_time = datetime.now(pytz.UTC)
             update_group_message(group_id, data["groups"][group_id].get("last_msg_id"), next_time)
             
             update_group_status(group_id, True)
@@ -72,8 +72,10 @@ class MessageScheduler:
             return False
             
     async def _message_loop(self, bot, group_id: str, message: str, delay: int):
+        """Message loop that sends first message immediately then follows delay."""
         retry_count = 0
         max_retries = 3
+        first_run = True  # Add flag for first message
         
         while True:
             try:
@@ -82,25 +84,28 @@ class MessageScheduler:
                     logger.info(f"Loop stopped for group {group_id} - User command")
                     break
 
-                current_time = datetime.now(pytz.UTC)
-                next_schedule_str = data["groups"][group_id].get("next_schedule")
-                
-                # Calculate appropriate wait time
-                next_time = self.calculate_next_schedule(current_time, next_schedule_str, delay)
-                wait_time = (next_time - current_time).total_seconds()
-                
-                if wait_time > 0:
-                    await asyncio.sleep(wait_time)
+                # For first message, send immediately without delay
+                if first_run:
+                    first_run = False
+                else:
+                    # Calculate wait time for subsequent messages
+                    current_time = datetime.now(pytz.UTC)
+                    next_schedule_str = data["groups"][group_id].get("next_schedule")
+                    next_time = self.calculate_next_schedule(current_time, next_schedule_str, delay)
+                    wait_time = (next_time - current_time).total_seconds()
+                    
+                    if wait_time > 0:
+                        await asyncio.sleep(wait_time)
 
                 try:
                     async with asyncio.timeout(30):
-                        # First try to send new message
+                        # Send new message
                         sent_message = await bot.send_message(
                             chat_id=int(group_id), 
                             text=message
                         )
                         
-                        # If message sent successfully, try to delete previous
+                        # Try to delete previous message
                         last_msg_id = data["groups"][group_id].get("last_msg_id")
                         if last_msg_id:
                             try:
