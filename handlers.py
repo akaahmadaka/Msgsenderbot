@@ -139,8 +139,7 @@ async def setmsg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error in setmsg: {e}")
         await update.message.reply_text("❌ Failed to start message update")
         return ConversationHandler.END
-
-# Add new handler functions
+        
 async def receive_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the received message for setmsg."""
     try:
@@ -151,9 +150,14 @@ async def receive_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         new_message = update.message.text
         settings = update_global_settings(message=new_message)
         
+        # Update running tasks with new message
+        from scheduler import scheduler
+        updated_count = await scheduler.update_running_tasks(context.bot, new_message=new_message)
+        
         await update.message.reply_text(
             f"✅ Global message updated!\n"
-            f"New message: {settings['message']}"
+            f"New message: {settings['message']}\n"
+            f"Updated {updated_count} running tasks"
         )
         return ConversationHandler.END
 
@@ -189,11 +193,17 @@ async def setdelay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Please provide a valid number!")
             return
 
+        # Update global settings
         settings = update_global_settings(delay=new_delay)
+        
+        # Update running tasks with new delay
+        from scheduler import scheduler
+        updated_count = await scheduler.update_running_tasks(context.bot, new_delay=new_delay)
         
         await update.message.reply_text(
             f"✅ Global delay updated!\n"
-            f"New delay: {settings['delay']} seconds"
+            f"New delay: {settings['delay']} seconds\n"
+            f"Updated {updated_count} running tasks"
         )
 
     except Exception as e:

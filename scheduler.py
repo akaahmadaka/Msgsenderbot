@@ -234,6 +234,42 @@ class MessageScheduler:
             except Exception as e:
                 logger.error(f"Failed to remove task for group {group_id} - {str(e)}")
 
+    async def update_running_tasks(self, bot, new_delay: int = None, new_message: str = None):
+        """Update all running tasks with new delay or message."""
+        try:
+            data = load_data()
+            settings = get_global_settings()
+            current_time = datetime.now(pytz.UTC)
+            
+            # Store current tasks
+            current_tasks = self.tasks.copy()
+            
+            # Cancel and recreate each running task
+            for group_id, task in current_tasks.items():
+                if not task.done() and data["groups"].get(group_id, {}).get("active", False):
+                    # Cancel current task
+                    await self.remove_scheduled_job(group_id)
+                    
+                    # Calculate new next schedule
+                    next_time = current_time + timedelta(seconds=(new_delay or settings["delay"]))
+                    update_group_message(group_id, data["groups"][group_id].get("last_msg_id"), next_time)
+                    
+                    # Create new task with updated parameters
+                    self.tasks[group_id] = asyncio.create_task(
+                        self._message_loop(
+                            bot,
+                            group_id,
+                            new_message or settings["message"],
+                            new_delay or settings["delay"]
+                        )
+                    )
+                    logger.info(f"Updated task for group {group_id} with new settings")
+            
+            return len(self.tasks)
+        except Exception as e:
+            logger.error(f"Failed to update running tasks: {e}")
+            return 0
+        
     def is_running(self, group_id: str) -> bool:
         return group_id in self.tasks and not self.tasks[group_id].done()
 
