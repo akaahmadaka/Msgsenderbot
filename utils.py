@@ -48,6 +48,8 @@ def save_data(data):
         logger.error(f"Error saving data: {e}")
         raise
 
+# In utils.py, modify the add_group function
+
 def add_group(group_id, group_name):
     """Add a new group to the data file."""
     try:
@@ -58,7 +60,8 @@ def add_group(group_id, group_name):
                 "last_msg_id": None,
                 "next_schedule": None,
                 "active": False,
-                "error_count": 0
+                "error_count": 0,
+                "error_state": False  # Add this field
             }
             save_data(data)
         return data["groups"][group_id]
