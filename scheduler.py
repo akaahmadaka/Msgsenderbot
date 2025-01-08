@@ -234,8 +234,8 @@ class MessageScheduler:
             except Exception as e:
                 logger.error(f"Failed to remove task for group {group_id} - {str(e)}")
 
-    async def update_running_tasks(self, bot, new_delay: int = None, new_message: str = None):
-        """Update all running tasks with new delay or message."""
+    async def update_running_tasks(self, bot, new_message: Optional[str] = None, new_delay: Optional[int] = None):
+        """Update all running tasks with new settings."""
         try:
             data = load_data()
             settings = get_global_settings()
@@ -243,29 +243,35 @@ class MessageScheduler:
             
             # Store current tasks
             current_tasks = self.tasks.copy()
+            updated_count = 0
             
-            # Cancel and recreate each running task
+            # Cancel and recreate each running task with new settings
             for group_id, task in current_tasks.items():
                 if not task.done() and data["groups"].get(group_id, {}).get("active", False):
                     # Cancel current task
                     await self.remove_scheduled_job(group_id)
                     
+                    # Get current settings with updates
+                    msg = new_message if new_message is not None else settings["message"]
+                    delay = new_delay if new_delay is not None else settings["delay"]
+                    
                     # Calculate new next schedule
-                    next_time = current_time + timedelta(seconds=(new_delay or settings["delay"]))
+                    next_time = current_time + timedelta(seconds=delay)
                     update_group_message(group_id, data["groups"][group_id].get("last_msg_id"), next_time)
                     
-                    # Create new task with updated parameters
+                    # Create new task
                     self.tasks[group_id] = asyncio.create_task(
                         self._message_loop(
                             bot,
                             group_id,
-                            new_message or settings["message"],
-                            new_delay or settings["delay"]
+                            msg,
+                            delay
                         )
                     )
+                    updated_count += 1
                     logger.info(f"Updated task for group {group_id} with new settings")
             
-            return len(self.tasks)
+            return updated_count
         except Exception as e:
             logger.error(f"Failed to update running tasks: {e}")
             return 0

@@ -152,7 +152,7 @@ async def receive_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         # Update running tasks with new message
         from scheduler import scheduler
-        updated_count = await scheduler.update_running_tasks(context.bot, new_message=new_message)
+        updated_count = await scheduler.update_running_tasks(context.bot, message=new_message)
         
         await update.message.reply_text(
             f"✅ Global message updated!\n"
@@ -198,7 +198,10 @@ async def setdelay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Update running tasks with new delay
         from scheduler import scheduler
-        updated_count = await scheduler.update_running_tasks(context.bot, new_delay=new_delay)
+        updated_count = await scheduler.update_running_tasks(
+            context.bot,
+            new_delay=new_delay
+        )
         
         await update.message.reply_text(
             f"✅ Global delay updated!\n"
@@ -209,6 +212,36 @@ async def setdelay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error in setdelay: {e}")
         await update.message.reply_text("❌ Failed to update delay")
+
+
+async def receive_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the received message for setmsg."""
+    try:
+        # Check admin permission again for safety
+        if not is_admin(update.effective_user.id):
+            return ConversationHandler.END
+
+        new_message = update.message.text
+        settings = update_global_settings(message=new_message)
+        
+        # Update running tasks with new message
+        from scheduler import scheduler
+        updated_count = await scheduler.update_running_tasks(
+            context.bot,
+            new_message=new_message
+        )
+        
+        await update.message.reply_text(
+            f"✅ Global message updated!\n"
+            f"New message: {settings['message']}\n"
+            f"Updated {updated_count} running tasks"
+        )
+        return ConversationHandler.END
+
+    except Exception as e:
+        logger.error(f"Error updating message: {e}")
+        await update.message.reply_text("❌ Failed to update message")
+        return ConversationHandler.END
 
 async def startall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start message loop in all manually stopped groups (Admin only)."""
@@ -340,13 +373,21 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def get_handlers():
     """Return all command handlers."""
-    from telegram.ext import CommandHandler
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("setmsg", setmsg)],
+        states={
+            WAITING_FOR_MESSAGE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_new_message)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
     
     return [
-        CommandHandler("start", start, filters.ChatType.PRIVATE | filters.ChatType.GROUPS),  # Modified
+        CommandHandler("start", start, filters.ChatType.PRIVATE | filters.ChatType.GROUPS),
         CommandHandler("startloop", startloop),
         CommandHandler("stoploop", stoploop),
-        CommandHandler("setmsg", setmsg),
+        conv_handler,  # Add conversation handler
         CommandHandler("setdelay", setdelay),
         CommandHandler("status", status),
         CommandHandler("startall", startall),
