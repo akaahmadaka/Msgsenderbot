@@ -53,7 +53,7 @@ class MessageScheduler:
         except Exception as e:
             logger.error(f"Failed to schedule messages for group {group_id} - {str(e)}")
             return False
-
+            
     async def _message_loop(self, bot, group_id: str, message: str, delay: int):
         retry_count = 0
         max_retries = 3
@@ -67,7 +67,18 @@ class MessageScheduler:
 
                 try:
                     async with asyncio.timeout(30):
-                        # Send message and get the message ID
+                        # Try to delete previous message if exists
+                        last_msg_id = data["groups"][group_id].get("last_msg_id")
+                        if last_msg_id:
+                            try:
+                                await bot.delete_message(
+                                    chat_id=int(group_id),
+                                    message_id=last_msg_id
+                                )
+                            except Exception as del_err:
+                                logger.warning(f"Could not delete previous message in {group_id}: {del_err}")
+
+                        # Send new message
                         sent_message = await bot.send_message(
                             chat_id=int(group_id), 
                             text=message
@@ -81,7 +92,7 @@ class MessageScheduler:
                         update_group_message(group_id, sent_message.message_id, next_time)
                         
                         retry_count = 0
-                        
+
                 except Forbidden as e:
                     error_msg = str(e).lower()
                     if "bot was kicked" in error_msg:
