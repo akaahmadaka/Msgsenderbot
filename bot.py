@@ -4,7 +4,7 @@ import signal
 import sys
 import logging
 from telegram.ext import Application, CommandHandler
-from handlers import start, startloop, stoploop, setmsg, setdelay, status
+from handlers import start, startloop, stoploop, setmsg, setdelay, startall, stopall, status
 from scheduler import start_scheduler, stop_scheduler
 from config import BOT_TOKEN
 
@@ -41,12 +41,20 @@ class Bot:
     def setup_handlers(self):
         """Setup command handlers"""
         try:
-            self.app.add_handler(CommandHandler("start", start))
-            self.app.add_handler(CommandHandler("startloop", startloop))
-            self.app.add_handler(CommandHandler("stoploop", stoploop))
-            self.app.add_handler(CommandHandler("setmsg", setmsg))
-            self.app.add_handler(CommandHandler("setdelay", setdelay))
-            self.app.add_handler(CommandHandler("status", status))
+            handlers = [
+                ("start", start),
+                ("startloop", startloop),
+                ("stoploop", stoploop),
+                ("setmsg", setmsg),
+                ("setdelay", setdelay),
+                ("status", status),
+                ("startall", startall),
+                ("stopall", stopall)
+            ]
+            
+            for command, handler in handlers:
+                self.app.add_handler(CommandHandler(command, handler))
+                
             self.app.add_error_handler(self.error_handler)
         except Exception as e:
             logger.error(f"Handler setup failed: {e}")
