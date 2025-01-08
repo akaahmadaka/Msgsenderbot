@@ -1,7 +1,7 @@
 # handlers.py
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import ContextTypes
+from telegram.ext import ContextTypes, CommandHandler, filters
 from utils import (
     load_data, add_group, get_global_settings, 
     update_global_settings, update_group_status, remove_group
@@ -27,26 +27,32 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command."""
-    is_admin_user = is_admin(update.effective_user.id)
-    
-    base_commands = (
-        "👋 Welcome to Message Loop Bot!\n\n"
-        "Available Commands:\n"
-        "/startloop - Start message loop in group\n"
-        "/stoploop - Stop message loop in group\n"
-    )
-    
-    admin_commands = (
-        "/setmsg <message> - Set message (Admin)\n"
-        "/setdelay <seconds> - Set delay (Admin)\n"
-        "/status - Check bot status (Admin)\n"
-        "/startall - Start all stopped groups (Admin, private)\n"
-        "/stopall - Stop all running groups (Admin, private)"
-    )
-    
-    welcome_message = base_commands + (admin_commands if is_admin_user else "")
-    await update.message.reply_text(welcome_message)
+    """Handle /start command and deep linking."""
+    try:
+        # Only respond in private chat or when deep linking
+        if update.message.chat.type in ["group", "supergroup"]:
+            # Check if it's a deep link command
+            args = context.args
+            if args and args[0] == "startloop":
+                # Execute startloop command
+                await startloop(update, context)
+            # Don't respond to regular /start in groups
+            return
+        
+        # In private chat, show the add to group message
+        bot_username = (await context.bot.get_me()).username
+        deep_link = f"t.me/{bot_username}?startgroup=startloop"
+        
+        welcome_message = (
+            "👋 Add me in group and send /startloop\n"
+            f"Or click here 👉 {deep_link}"
+        )
+        
+        await update.message.reply_text(welcome_message)
+
+    except Exception as e:
+        logger.error(f"Error in start command: {e}")
+        await update.message.reply_text("❌ An error occurred")
 
 async def startloop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start message loop in a group."""
@@ -61,7 +67,6 @@ async def startloop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Check if already running
         if is_running(group_id):
-            await update.message.reply_text("⚠️ Message loop is already running!")
             return
 
         # Add or update group
@@ -76,13 +81,7 @@ async def startloop(update: Update, context: ContextTypes.DEFAULT_TYPE):
             delay=settings["delay"]
         )
 
-        if success:
-            await update.message.reply_text(
-                f"✅ Message loop started!\n"
-                f"Message: {settings['message']}\n"
-                f"Delay: {settings['delay']} seconds"
-            )
-        else:
+        if not success:
             await update.message.reply_text("❌ Failed to start message loop")
 
     except Exception as e:
@@ -103,7 +102,6 @@ async def stoploop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data = load_data()
         if group_id not in data["groups"]:
             logger.info(f"Stop command failed - Group {group_id} not found in database")
-            await update.message.reply_text("❌ No active loop found!")
             return
 
         # Update group status to inactive
@@ -113,9 +111,6 @@ async def stoploop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Stop the loop
         await remove_scheduled_job(group_id)
         logger.info(f"Message loop stopped for group {group_id}")
-
-        # Send confirmation
-        await update.message.reply_text("✅ Message loop stopped!")
 
     except Exception as e:
         logger.error(f"Stop command failed - {str(e)}")
@@ -312,7 +307,7 @@ def get_handlers():
     from telegram.ext import CommandHandler
     
     return [
-        CommandHandler("start", start),
+        CommandHandler("start", start, filters.ChatType.PRIVATE | filters.ChatType.GROUPS),  # Modified
         CommandHandler("startloop", startloop),
         CommandHandler("stoploop", stoploop),
         CommandHandler("setmsg", setmsg),
