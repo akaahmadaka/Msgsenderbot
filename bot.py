@@ -3,20 +3,15 @@ import asyncio
 import signal
 import sys
 import logging
-from telegram.ext import (
-    Application, CommandHandler, filters,
-    ConversationHandler, MessageHandler
-)
+from telegram.ext import Application, CommandHandler, filters
 from handlers import (
     start, startloop, stoploop, 
     setmsg, setdelay, status,
-    startall, stopall,
-    # New imports for conversation handler
-    receive_new_message, cancel,
-    WAITING_FOR_MESSAGE
+    startall, stopall
 )
-from scheduler import start_scheduler, stop_scheduler
+from scheduler import start_scheduler, stop_scheduler, scheduler
 from config import BOT_TOKEN
+from utils import get_global_settings
 
 # Disable all external loggers
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -51,28 +46,13 @@ class Bot:
     def setup_handlers(self):
         """Setup command handlers"""
         try:
-            # Create conversation handler for setmsg
-            setmsg_conv_handler = ConversationHandler(
-                entry_points=[CommandHandler("setmsg", setmsg)],
-                states={
-                    WAITING_FOR_MESSAGE: [
-                        MessageHandler(filters.TEXT & ~filters.COMMAND, receive_new_message)
-                    ],
-                },
-                fallbacks=[CommandHandler("cancel", cancel)],
-                allow_reentry=True,
-                conversation_timeout=300  # Timeout after 5 minutes
-            )
-            
-            # Add conversation handler first
-            self.app.add_handler(setmsg_conv_handler)
-            
-            # Define other handlers with their filters
+            # Define handlers with their filters
             handlers = [
                 # Start command only responds in private or with deep link
                 ("start", start, filters.ChatType.PRIVATE | (filters.ChatType.GROUPS & filters.Regex(r"startloop"))),
                 ("startloop", startloop, None),
                 ("stoploop", stoploop, None),
+                ("setmsg", setmsg, None),
                 ("setdelay", setdelay, None),
                 ("status", status, None),
                 ("startall", startall, filters.ChatType.PRIVATE),  # Admin commands in private only
@@ -99,12 +79,41 @@ class Bot:
     async def start(self):
         """Start bot"""
         try:
-            # Initialize scheduler
+            # Initialize scheduler first
             await start_scheduler()
+            
+            # Initialize and start application
             await self.app.initialize()
             await self.app.start()
             
             self.is_running = True
+            
+            # Get global settings
+            settings = get_global_settings()
+            
+            # Recreate tasks with bot instance for all active groups
+            active_tasks = {}
+            for group_id, task in scheduler.tasks.items():
+                if not task.done():
+                    # Cancel existing task
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    
+                    # Create new task with bot instance
+                    active_tasks[group_id] = asyncio.create_task(
+                        scheduler._message_loop(
+                            self.app.bot,
+                            group_id,
+                            settings["message"],
+                            settings["delay"]
+                        )
+                    )
+            
+            # Update scheduler tasks with new bot-enabled tasks
+            scheduler.tasks = active_tasks
             
             # Start polling with specific updates
             await self.app.updater.start_polling(
@@ -112,7 +121,7 @@ class Bot:
                 drop_pending_updates=True
             )
             
-            logger.info("Bot started successfully")
+            logger.info(f"Bot started successfully with {len(active_tasks)} active tasks")
             
             # Keep bot alive
             while self.is_running:

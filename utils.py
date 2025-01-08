@@ -3,6 +3,7 @@ import json
 import os
 import logging
 from datetime import datetime
+import pytz
 
 # Configure logging
 logging.basicConfig(
@@ -58,10 +59,10 @@ def add_group(group_id, group_name):
             data["groups"][group_id] = {
                 "name": group_name,
                 "last_msg_id": None,
-                "next_schedule": None,
+                "next_schedule": None,  # Will be set when loop starts
                 "active": False,
                 "error_count": 0,
-                "error_state": False  # Add this field
+                "error_state": False
             }
             save_data(data)
         return data["groups"][group_id]
@@ -70,14 +71,15 @@ def add_group(group_id, group_name):
         raise
 
 def update_group_message(group_id, message_id, next_time):
-    """Update group's message information."""
+    """Update group's message information with UTC datetime."""
     try:
         data = load_data()
         if group_id in data["groups"]:
             data["groups"][group_id]["last_msg_id"] = message_id
-            data["groups"][group_id]["next_schedule"] = next_time.strftime("%H:%M:%S")  # Full datetime format
+            # Store as ISO format UTC datetime
+            data["groups"][group_id]["next_schedule"] = next_time.astimezone(pytz.UTC).isoformat()
             save_data(data)
-            logger.info(f"Updated message info for group {group_id} - Next: {next_time.strftime('%H:%M:%S')}")
+            logger.info(f"Updated message info for group {group_id} - Next: {next_time.isoformat()}")
             return True
         return False
     except Exception as e:

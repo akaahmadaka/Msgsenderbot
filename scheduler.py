@@ -2,10 +2,12 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, Optional
 import logging
+import pytz
 from telegram.error import Forbidden, ChatMigrated, BadRequest, NetworkError
 from utils import (
     load_data, save_data, remove_group, 
-    get_global_settings, update_group_status
+    get_global_settings, update_group_status,
+    update_group_message
 )
 
 # Disable all external loggers
@@ -28,6 +30,17 @@ class MessageScheduler:
     def __init__(self):
         self.tasks: Dict[str, asyncio.Task] = {}
         logger.info("Scheduler ready")
+
+    def calculate_next_schedule(self, current_time: datetime, next_schedule_str: Optional[str], delay: int) -> datetime:
+        """Calculate the appropriate next schedule time."""
+        try:
+            if next_schedule_str:
+                next_schedule = datetime.fromisoformat(next_schedule_str.replace('Z', '+00:00'))
+                if next_schedule > current_time:
+                    return next_schedule
+            return current_time + timedelta(seconds=delay)
+        except Exception:
+            return current_time + timedelta(seconds=delay)
         
     async def schedule_message(self, bot, group_id: str, message: Optional[str] = None, delay: Optional[int] = None):
         try:
@@ -42,6 +55,10 @@ class MessageScheduler:
             delay = delay or settings["delay"]
             
             await self.remove_scheduled_job(group_id)
+            
+            # Calculate initial next schedule
+            next_time = datetime.now(pytz.UTC) + timedelta(seconds=delay)
+            update_group_message(group_id, data["groups"][group_id].get("last_msg_id"), next_time)
             
             update_group_status(group_id, True)
             self.tasks[group_id] = asyncio.create_task(
@@ -65,6 +82,16 @@ class MessageScheduler:
                     logger.info(f"Loop stopped for group {group_id} - User command")
                     break
 
+                current_time = datetime.now(pytz.UTC)
+                next_schedule_str = data["groups"][group_id].get("next_schedule")
+                
+                # Calculate appropriate wait time
+                next_time = self.calculate_next_schedule(current_time, next_schedule_str, delay)
+                wait_time = (next_time - current_time).total_seconds()
+                
+                if wait_time > 0:
+                    await asyncio.sleep(wait_time)
+
                 try:
                     async with asyncio.timeout(30):
                         # First try to send new message
@@ -73,7 +100,7 @@ class MessageScheduler:
                             text=message
                         )
                         
-                        # If message was sent successfully, then try to delete the previous message
+                        # If message sent successfully, try to delete previous
                         last_msg_id = data["groups"][group_id].get("last_msg_id")
                         if last_msg_id:
                             try:
@@ -84,11 +111,8 @@ class MessageScheduler:
                             except Exception as del_err:
                                 logger.warning(f"Could not delete previous message in {group_id}: {del_err}")
                         
-                        # Calculate next schedule time
-                        next_time = datetime.now() + timedelta(seconds=delay)
-                        
-                        # Update message info in data file
-                        from utils import update_group_message
+                        # Calculate and set next schedule
+                        next_time = datetime.now(pytz.UTC) + timedelta(seconds=delay)
                         update_group_message(group_id, sent_message.message_id, next_time)
                         
                         retry_count = 0
@@ -140,8 +164,6 @@ class MessageScheduler:
                         logger.error(f"{error_type} in group {group_id} - Max retries reached")
                         await self.handle_error(group_id)
                         break
-
-                await asyncio.sleep(delay)
                 
             except Exception as e:
                 logger.error(f"Unexpected error in group {group_id} - {str(e)}")
@@ -219,11 +241,35 @@ class MessageScheduler:
         return len([task for task in self.tasks.values() if not task.done()])
 
     async def start(self):
+        """Initialize scheduler and recover active tasks."""
         try:
             data = load_data()
-            for group_id in data["groups"]:
-                update_group_status(group_id, False)
-            logger.info("Scheduler initialized - Groups reset")
+            settings = get_global_settings()
+            current_time = datetime.now(pytz.UTC)
+            
+            for group_id, group in data["groups"].items():
+                if group.get("active", False):
+                    next_schedule_str = group.get("next_schedule")
+                    next_time = self.calculate_next_schedule(
+                        current_time,
+                        next_schedule_str,
+                        settings["delay"]
+                    )
+                    # Update the schedule
+                    update_group_message(group_id, group.get("last_msg_id"), next_time)
+                    logger.info(f"Recovered schedule for group {group_id} - Next: {next_time.isoformat()}")
+                    
+                    # Create and start the message loop task
+                    self.tasks[group_id] = asyncio.create_task(
+                        self._message_loop(
+                            None,  # Bot will be injected later from main.py
+                            group_id,
+                            settings["message"],
+                            settings["delay"]
+                        )
+                    )
+            
+            logger.info(f"Scheduler initialized - {len(self.tasks)} active groups recovered")
         except Exception as e:
             logger.error(f"Scheduler start failed - {str(e)}")
 
