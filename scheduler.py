@@ -29,6 +29,7 @@ logger.setLevel(logging.INFO)
 class MessageScheduler:
     def __init__(self):
         self.tasks: Dict[str, asyncio.Task] = {}
+        self.pending_groups: Dict[str, dict] = {}  # Add this to store groups waiting for bot
         logger.info("Scheduler ready")
 
     def calculate_next_schedule(self, current_time: datetime, next_schedule_str: Optional[str], delay: int) -> datetime:
@@ -303,19 +304,36 @@ class MessageScheduler:
                     update_group_message(group_id, group.get("last_msg_id"), next_time)
                     logger.info(f"Recovered schedule for group {group_id} - Next: {next_time.isoformat()}")
                     
-                    # Create and start the message loop task
-                    self.tasks[group_id] = asyncio.create_task(
-                        self._message_loop(
-                            None,  # Bot will be injected later from main.py
-                            group_id,
-                            settings["message"],
-                            settings["delay"]
-                        )
-                    )
+                    # Store group info for later task creation
+                    self.pending_groups[group_id] = {
+                        "message": settings["message"],
+                        "delay": settings["delay"]
+                    }
             
-            logger.info(f"Scheduler initialized - {len(self.tasks)} active groups recovered")
+            logger.info(f"Scheduler initialized - {len(self.pending_groups)} active groups pending")
         except Exception as e:
             logger.error(f"Scheduler start failed - {str(e)}")
+
+    async def initialize_pending_tasks(self, bot):
+        """Initialize tasks for recovered groups with bot instance."""
+        try:
+            for group_id, settings in self.pending_groups.items():
+                self.tasks[group_id] = asyncio.create_task(
+                    self._message_loop(
+                        bot,
+                        group_id,
+                        settings["message"],
+                        settings["delay"]
+                    )
+                )
+                logger.info(f"Created task for recovered group {group_id}")
+            
+            started_count = len(self.pending_groups)
+            self.pending_groups.clear()  # Clear pending groups after starting tasks
+            return started_count
+        except Exception as e:
+            logger.error(f"Failed to initialize pending tasks: {e}")
+            return 0
 
     async def shutdown(self):
         try:

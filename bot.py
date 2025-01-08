@@ -100,32 +100,8 @@ class Bot:
             
             self.is_running = True
             
-            # Get global settings
-            settings = get_global_settings()
-            
-            # Recreate tasks with bot instance for all active groups
-            active_tasks = {}
-            for group_id, task in scheduler.tasks.items():
-                if not task.done():
-                    # Cancel existing task
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-                    
-                    # Create new task with bot instance
-                    active_tasks[group_id] = asyncio.create_task(
-                        scheduler._message_loop(
-                            self.app.bot,
-                            group_id,
-                            settings["message"],
-                            settings["delay"]
-                        )
-                    )
-            
-            # Update scheduler tasks with new bot-enabled tasks
-            scheduler.tasks = active_tasks
+            # Initialize recovered tasks with bot instance
+            recovered_count = await scheduler.initialize_pending_tasks(self.app.bot)
             
             # Start polling with specific updates
             await self.app.updater.start_polling(
@@ -133,7 +109,7 @@ class Bot:
                 drop_pending_updates=True
             )
             
-            logger.info(f"Bot started successfully with {len(active_tasks)} active tasks")
+            logger.info(f"Bot started successfully with {recovered_count} recovered tasks")
             
             # Keep bot alive
             while self.is_running:
