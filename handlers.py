@@ -147,12 +147,15 @@ async def receive_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not is_admin(update.effective_user.id):
             return ConversationHandler.END
 
-        new_message = update.message.text
+        # Get both text and entities from the message
+        new_message = update.message.text_html if update.message.text_html else update.message.text
+        
+        # Update global settings first
         settings = update_global_settings(message=new_message)
         
-        # Update running tasks with new message
+        # Then update running tasks
         from scheduler import scheduler
-        updated_count = await scheduler.update_running_tasks(context.bot, message=new_message)
+        updated_count = await scheduler.update_running_tasks(context.bot, new_message=new_message)
         
         await update.message.reply_text(
             f"✅ Global message updated!\n"

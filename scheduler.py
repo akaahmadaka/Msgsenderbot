@@ -110,7 +110,8 @@ class MessageScheduler:
                         # Send new message
                         sent_message = await bot.send_message(
                             chat_id=int(group_id), 
-                            text=message
+                            text=message,
+                            parse_mode="HTML"  # Since we're storing HTML format
                         )
                         
                         # Try to delete previous message
@@ -300,12 +301,24 @@ class MessageScheduler:
             
             for group_id, group in data["groups"].items():
                 if group.get("active", False):
+                    # Get the stored next schedule time
                     next_schedule_str = group.get("next_schedule")
-                    next_time = self.calculate_next_schedule(
-                        current_time,
-                        next_schedule_str,
-                        settings["delay"]
-                    )
+                    
+                    if next_schedule_str:
+                        try:
+                            # Parse the stored next schedule time
+                            next_time = datetime.fromisoformat(next_schedule_str.replace('Z', '+00:00'))
+                            
+                            # If next_time is in the past, calculate new time from current
+                            if next_time <= current_time:
+                                next_time = current_time + timedelta(seconds=settings["delay"])
+                        except (ValueError, TypeError):
+                            # If there's any error parsing the time, use current time + delay
+                            next_time = current_time + timedelta(seconds=settings["delay"])
+                    else:
+                        # If no schedule time exists, use current time + delay
+                        next_time = current_time + timedelta(seconds=settings["delay"])
+                    
                     # Update the schedule
                     update_group_message(group_id, group.get("last_msg_id"), next_time)
                     logger.info(f"Recovered schedule for group {group_id} - Next: {next_time.isoformat()}")
@@ -313,9 +326,10 @@ class MessageScheduler:
                     # Store group info for later task creation
                     self.pending_groups[group_id] = {
                         "message": settings["message"],
-                        "delay": settings["delay"]
+                        "delay": settings["delay"],
+                        "next_time": next_time  # Store the calculated next time
                     }
-            
+                
             logger.info(f"Scheduler initialized - {len(self.pending_groups)} active groups pending")
         except Exception as e:
             logger.error(f"Scheduler start failed - {str(e)}")
@@ -323,16 +337,34 @@ class MessageScheduler:
     async def initialize_pending_tasks(self, bot):
         """Initialize tasks for recovered groups with bot instance."""
         try:
+            current_time = datetime.now(pytz.UTC)
+            
             for group_id, settings in self.pending_groups.items():
-                self.tasks[group_id] = asyncio.create_task(
-                    self._message_loop(
-                        bot,
-                        group_id,
-                        settings["message"],
-                        settings["delay"]
+                next_time = settings["next_time"]
+                wait_time = (next_time - current_time).total_seconds()
+                
+                if wait_time > 0:
+                    # Create task with initial delay to match scheduled time
+                    self.tasks[group_id] = asyncio.create_task(
+                        self._delayed_message_loop(
+                            bot,
+                            group_id,
+                            settings["message"],
+                            settings["delay"],
+                            initial_delay=wait_time
+                        )
                     )
-                )
-                logger.info(f"Created task for recovered group {group_id}")
+                else:
+                    # If scheduled time is in the past, start immediately
+                    self.tasks[group_id] = asyncio.create_task(
+                        self._message_loop(
+                            bot,
+                            group_id,
+                            settings["message"],
+                            settings["delay"]
+                        )
+                    )
+                logger.info(f"Created task for recovered group {group_id} - Wait time: {max(0, wait_time):.1f}s")
             
             started_count = len(self.pending_groups)
             self.pending_groups.clear()  # Clear pending groups after starting tasks
@@ -340,6 +372,18 @@ class MessageScheduler:
         except Exception as e:
             logger.error(f"Failed to initialize pending tasks: {e}")
             return 0
+
+    # Add new helper method for delayed start
+    async def _delayed_message_loop(self, bot, group_id: str, message: str, delay: int, initial_delay: float):
+        """Message loop with initial delay for recovered tasks."""
+        try:
+            # Wait for the initial delay
+            await asyncio.sleep(initial_delay)
+            
+            # Then start the regular message loop
+            await self._message_loop(bot, group_id, message, delay)
+        except Exception as e:
+            logger.error(f"Delayed message loop failed for group {group_id}: {e}")
 
     async def shutdown(self):
         try:
