@@ -5,7 +5,7 @@ import sys
 import logging
 from telegram.ext import Application, CommandHandler, filters, ConversationHandler, MessageHandler
 from handlers import (
-    start, startloop, stoploop, 
+    start, startloop, stoploop,
     setmsg, setdelay, status,
     startall, stopall, WAITING_FOR_MESSAGE, receive_new_message, cancel
 )
@@ -56,7 +56,7 @@ class Bot:
                 },
                 fallbacks=[CommandHandler("cancel", cancel)],
             )
-            
+
             # Define regular handlers with their filters
             handlers = [
                 ("start", start, filters.ChatType.PRIVATE | (filters.ChatType.GROUPS & filters.Regex(r"startloop"))),
@@ -67,15 +67,15 @@ class Bot:
                 ("startall", startall, filters.ChatType.PRIVATE),
                 ("stopall", stopall, filters.ChatType.PRIVATE)
             ]
-            
+
             # Add conversation handler first
             self.app.add_handler(conv_handler)
-            
+
             # Register other handlers
             for command, callback, filter_type in handlers:
                 handler = CommandHandler(command, callback, filters=filter_type) if filter_type else CommandHandler(command, callback)
                 self.app.add_handler(handler)
-                
+
             self.app.add_error_handler(self.error_handler)
             logger.info("Handlers setup completed successfully")
         except Exception as e:
@@ -93,28 +93,28 @@ class Bot:
         try:
             # Initialize scheduler first
             await start_scheduler()
-            
+
             # Initialize and start application
             await self.app.initialize()
             await self.app.start()
-            
+
             self.is_running = True
-            
+
             # Initialize recovered tasks with bot instance
             recovered_count = await scheduler.initialize_pending_tasks(self.app.bot)
-            
+
             # Start polling with specific updates
             await self.app.updater.start_polling(
                 allowed_updates=["message", "callback_query"],
                 drop_pending_updates=True
             )
-            
+
             logger.info(f"Bot started successfully with {recovered_count} recovered tasks")
-            
+
             # Keep bot alive
             while self.is_running:
                 await asyncio.sleep(1)
-                
+
         except Exception as e:
             logger.error(f"Start failed: {e}")
             self.is_running = False
@@ -125,16 +125,16 @@ class Bot:
         """Stop bot"""
         try:
             self.is_running = False
-            
+
             # Stop scheduler
             await stop_scheduler()
-            
+
             # Stop bot components
             if self.app.updater and self.app.updater.running:
                 await self.app.updater.stop()
             await self.app.stop()
             await self.app.shutdown()
-            
+
             logger.info("Bot stopped successfully")
         except Exception as e:
             logger.error(f"Stop failed: {e}")

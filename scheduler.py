@@ -1,4 +1,5 @@
 import asyncio
+import sys
 from datetime import datetime, timedelta
 from typing import Dict, Optional
 import logging
@@ -76,8 +77,14 @@ class MessageScheduler:
         """Message loop that sends first message immediately then follows delay."""
         retry_count = 0
         max_retries = 3
-        first_run = True  # Add flag for first message
+        first_run = True  # Flag for first message
         
+        # For Python < 3.11, use async_timeout instead
+        if sys.version_info < (3, 11):
+            from async_timeout import timeout
+        else:
+            from asyncio import timeout
+
         while True:
             try:
                 data = load_data()
@@ -85,21 +92,21 @@ class MessageScheduler:
                     logger.info(f"Loop stopped for group {group_id} - User command")
                     break
 
-                # For first message, send immediately without delay
-                if first_run:
-                    first_run = False
-                else:
-                    # Calculate wait time for subsequent messages
-                    current_time = datetime.now(pytz.UTC)
-                    next_schedule_str = data["groups"][group_id].get("next_schedule")
-                    next_time = self.calculate_next_schedule(current_time, next_schedule_str, delay)
-                    wait_time = (next_time - current_time).total_seconds()
-                    
-                    if wait_time > 0:
-                        await asyncio.sleep(wait_time)
-
                 try:
-                    async with asyncio.timeout(30):
+                    # For first message, send immediately without delay
+                    if not first_run:
+                        current_time = datetime.now(pytz.UTC)
+                        next_schedule_str = data["groups"][group_id].get("next_schedule")
+                        next_time = self.calculate_next_schedule(current_time, next_schedule_str, delay)
+                        wait_time = (next_time - current_time).total_seconds()
+                        
+                        if wait_time > 0:
+                            await asyncio.sleep(wait_time)
+
+                    # Set first_run to False after first iteration
+                    first_run = False
+
+                    async with timeout(30):  # 30 second timeout for message operations
                         # Send new message
                         sent_message = await bot.send_message(
                             chat_id=int(group_id), 
@@ -120,8 +127,7 @@ class MessageScheduler:
                         # Calculate and set next schedule
                         next_time = datetime.now(pytz.UTC) + timedelta(seconds=delay)
                         update_group_message(group_id, sent_message.message_id, next_time)
-                        
-                        retry_count = 0
+                        retry_count = 0  # Reset retry count after successful message
 
                 except Forbidden as e:
                     error_msg = str(e).lower()
@@ -164,7 +170,7 @@ class MessageScheduler:
                     
                     if retry_count <= max_retries:
                         logger.warning(f"{error_type} in group {group_id} - Retry {retry_count}/{max_retries}")
-                        await asyncio.sleep(5 * retry_count)
+                        await asyncio.sleep(5 * retry_count)  # Exponential backoff
                         continue
                     else:
                         logger.error(f"{error_type} in group {group_id} - Max retries reached")

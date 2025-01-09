@@ -329,11 +329,15 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active_count = sum(1 for group in data["groups"].values() if group.get("active", False))
         total_count = len(data["groups"])
 
+        # Function to clean group names
+        def clean_name(name):
+            return name.replace('_', ' ').replace('|', '-')
+
         # Create status message with emojis and formatting
         status_msg = (
-            "📊 *Bot Status*\n\n"
+            "📊 Bot Status\n\n"
             f"📈 Groups: {total_count} │ Active: {active_count}\n\n"
-            "*Group Status:*\n"
+            "Group Status:\n"
         )
 
         # Separate active and stopped groups
@@ -341,7 +345,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stopped_groups = []
         
         for group_id, group in data["groups"].items():
-            group_name = group.get("name", "Unknown Group")
+            group_name = clean_name(group.get("name", "Unknown Group"))
             if group.get("active", False):
                 running_groups.append(f"🟢 {group_name}")
             else:
@@ -358,10 +362,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             status_msg += "❌ No groups found"
 
-        await update.message.reply_text(
-            status_msg,
-            parse_mode='Markdown'
-        )
+        await update.message.reply_text(status_msg)
 
     except Exception as e:
         logger.error(f"Status command failed - {str(e)}")
