@@ -4,12 +4,19 @@ from datetime import datetime, timedelta
 from typing import Dict, Optional
 import logging
 import pytz
-from telegram.error import Forbidden, ChatMigrated, BadRequest, NetworkError
+from telegram.error import (
+    Forbidden, BadRequest, NetworkError, ChatMigrated, RetryAfter
+)
 from utils import (
     load_data, save_data, remove_group, 
     get_global_settings, update_group_status,
     update_group_message
 )
+
+if sys.version_info >= (3, 11):
+    from asyncio import timeout
+else:
+    from async_timeout import timeout
 
 # Disable all external loggers
 for logger_name in ['httpx', 'telegram', 'apscheduler', 'asyncio']:
@@ -89,11 +96,6 @@ class MessageScheduler:
         retry_count = 0
         max_retries = 3
         first_run = True
-        
-        if sys.version_info < (3, 11):
-            from async_timeout import timeout
-        else:
-            from asyncio import timeout
 
         while True:
             try:
@@ -103,15 +105,10 @@ class MessageScheduler:
                     break
 
                 try:
-                    # Handle timing for non-first messages
                     if not first_run:
                         current_time = datetime.now(pytz.UTC)
                         next_schedule_str = data["groups"][group_id].get("next_schedule")
-                        next_time = self.calculate_next_schedule(
-                            current_time, 
-                            next_schedule_str, 
-                            delay
-                        )
+                        next_time = self.calculate_next_schedule(current_time, next_schedule_str, delay)
                         wait_time = (next_time - current_time).total_seconds()
                         
                         if wait_time > 0:
@@ -120,14 +117,36 @@ class MessageScheduler:
                     first_run = False
 
                     async with timeout(30):
-                        # Forward the message
-                        sent_message = await bot.copy_message(
-                            chat_id=int(group_id),
-                            from_chat_id=message_reference["chat_id"],
-                            message_id=message_reference["message_id"]
-                        )
+                        # Try to send message
+                        try:
+                            sent_message = await bot.copy_message(
+                                chat_id=int(group_id),
+                                from_chat_id=message_reference["chat_id"],
+                                message_id=message_reference["message_id"]
+                            )
+                        except (Forbidden, BadRequest) as e:
+                            error_msg = str(e).lower()
+                            logger.error(f"Telegram error in group {group_id}: {str(e)}")
+                            
+                            # Force cleanup for any permission/access error
+                            if any(msg in error_msg for msg in [
+                                "forbidden",
+                                "not a member",
+                                "chat not found",
+                                "bot was kicked",
+                                "not enough rights",
+                                "chat_write_forbidden",
+                                "The message can't be copied",
+                                "chat_send_plain_forbidden"
+                            ]):
+                                # Remove all data immediately
+                                await self.remove_scheduled_job(group_id)  # Cancel the task first
+                                remove_group(group_id)  # Remove from data file
+                                logger.info(f"Removed group {group_id} due to: {str(e)}")
+                                return  # Exit the loop completely
+                            raise  # Re-raise other errors
                         
-                        # Try to delete previous message
+                        # Message sent successfully - try to delete previous
                         last_msg_id = data["groups"][group_id].get("last_msg_id")
                         if last_msg_id:
                             try:
@@ -136,50 +155,65 @@ class MessageScheduler:
                                     message_id=last_msg_id
                                 )
                             except Exception as del_err:
-                                logger.warning(
-                                    f"Could not delete previous message in {group_id}: {del_err}"
-                                )
+                                logger.warning(f"Could not delete message in {group_id}: {del_err}")
                         
                         # Update next schedule
                         next_time = datetime.now(pytz.UTC) + timedelta(seconds=delay)
-                        update_group_message(
-                            group_id, 
-                            sent_message.message_id, 
-                            next_time
-                        )
+                        update_group_message(group_id, sent_message.message_id, next_time)
                         retry_count = 0
 
-                except Exception as e:
+                except (NetworkError, asyncio.TimeoutError) as e:
                     retry_count += 1
                     if retry_count <= max_retries:
-                        logger.warning(
-                            f"Error in group {group_id} - Retry {retry_count}/{max_retries}"
-                        )
+                        logger.warning(f"Network error in group {group_id} - Retry {retry_count}/{max_retries}")
                         await asyncio.sleep(5 * retry_count)
                         continue
                     else:
-                        raise
+                        logger.error(f"Network error persists in group {group_id} - Stopping loop")
+                        # Remove all data after max retries
+                        await self.remove_scheduled_job(group_id)
+                        remove_group(group_id)
+                        logger.info(f"Removed group {group_id} due to persistent network errors")
+                        return  # Exit the loop completely
 
             except Exception as e:
-                logger.error(f"Loop error in group {group_id}: {e}")
-                await self.handle_error(group_id)
-                break
-
-    async def handle_error(self, group_id: str):
-        try:
-            update_group_status(group_id, False)
-            await self.remove_scheduled_job(group_id)
-        except Exception as e:
-            logger.error(f"Error handler failed for group {group_id}: {e}")
+                logger.error(f"Unexpected error in group {group_id}: {str(e)}")
+                # Remove all data for any unexpected error
+                await self.remove_scheduled_job(group_id)
+                remove_group(group_id)
+                logger.info(f"Removed group {group_id} due to unexpected error")
+                return  # Exit the loop completely
 
     async def remove_scheduled_job(self, group_id: str):
+        """Remove a scheduled job and ensure it's cancelled."""
         if group_id in self.tasks:
             try:
-                self.tasks[group_id].cancel()
-                await asyncio.sleep(0.1)
-                del self.tasks[group_id]
+                self.tasks[group_id].cancel()  # Cancel the task
+                await asyncio.sleep(0.1)  # Small delay to ensure cancellation
+                del self.tasks[group_id]  # Remove from tasks dict
+                logger.info(f"Cancelled scheduled task for group {group_id}")
             except Exception as e:
-                logger.error(f"Failed to remove task for group {group_id}: {e}")
+                logger.error(f"Error cancelling task for group {group_id}: {e}")
+
+    async def handle_group_migration(self, bot, old_group_id: str, new_group_id: str):
+        """Handle group migration by updating group ID."""
+        try:
+            logger.info(f"Updating group {old_group_id} → {new_group_id}")
+            data = load_data()
+            
+            if old_group_id in data["groups"]:
+                data["groups"][str(new_group_id)] = data["groups"][old_group_id]
+                del data["groups"][old_group_id]
+                save_data(data)
+                
+                await self.remove_scheduled_job(old_group_id)
+                await self.schedule_message(bot, str(new_group_id))
+                logger.info(f"Group migration completed")
+            
+        except Exception as e:
+            logger.error(f"Migration failed: {e}")
+            await self.remove_scheduled_job(old_group_id)
+            remove_group(old_group_id)
 
     async def update_running_tasks(self, bot, new_message_reference: Optional[dict] = None, new_delay: Optional[int] = None):
         """Update all running tasks with new settings."""
