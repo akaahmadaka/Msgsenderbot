@@ -21,7 +21,8 @@ def load_data():
             default_data = {
                 "global_settings": {
                     "message": "Default message",
-                    "delay": 3600
+                    "delay": 3600,
+                    "message_reference": None  # Added message_reference
                 },
                 "groups": {}
             }
@@ -35,7 +36,8 @@ def load_data():
         return {
             "global_settings": {
                 "message": "Default message",
-                "delay": 3600
+                "delay": 3600,
+                "message_reference": None  # Added message_reference
             },
             "groups": {}
         }
@@ -48,8 +50,6 @@ def save_data(data):
     except Exception as e:
         logger.error(f"Error saving data: {e}")
         raise
-
-# In utils.py, modify the add_group function
 
 def add_group(group_id, group_name):
     """Add a new group to the data file."""
@@ -128,10 +128,11 @@ def get_global_settings():
     data = load_data()
     return data.get("global_settings", {
         "message": "Default message",
-        "delay": 3600
+        "delay": 3600,
+        "message_reference": None  # Added message_reference
     })
 
-def update_global_settings(message=None, delay=None):
+def update_global_settings(message=None, delay=None, message_reference=None):
     """Update global message and/or delay settings."""
     try:
         data = load_data()
@@ -139,6 +140,8 @@ def update_global_settings(message=None, delay=None):
             data["global_settings"]["message"] = message
         if delay is not None:
             data["global_settings"]["delay"] = delay
+        if message_reference is not None:  # Added message_reference handling
+            data["global_settings"]["message_reference"] = message_reference
         save_data(data)
         return data["global_settings"]
     except Exception as e:

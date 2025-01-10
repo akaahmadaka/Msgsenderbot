@@ -78,7 +78,7 @@ async def startloop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         success = await schedule_message(
             context.bot,
             group_id,
-            message=settings["message"],
+            message_reference=settings.get("message_reference"),  # Use message_reference
             delay=settings["delay"]
         )
 
@@ -147,19 +147,25 @@ async def receive_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not is_admin(update.effective_user.id):
             return ConversationHandler.END
 
-        # Get both text and entities from the message
-        new_message = update.message.text_html if update.message.text_html else update.message.text
+        # Store reference to the original message
+        message_reference = {
+            "chat_id": update.effective_message.chat_id,
+            "message_id": update.effective_message.message_id
+        }
         
-        # Update global settings first
-        settings = update_global_settings(message=new_message)
+        # Update global settings with message reference
+        settings = update_global_settings(message_reference=message_reference)
         
         # Then update running tasks
         from scheduler import scheduler
-        updated_count = await scheduler.update_running_tasks(context.bot, new_message=new_message)
+        updated_count = await scheduler.update_running_tasks(
+            context.bot,
+            new_message_reference=message_reference
+        )
         
         await update.message.reply_text(
-            f"✅ Global message updated!\n"
-            f"New message: {settings['message']}\n"
+            "✅ Global message updated!\n"
+            f"Message ID: {message_reference['message_id']}\n"
             f"Updated {updated_count} running tasks"
         )
         return ConversationHandler.END
@@ -213,35 +219,6 @@ async def setdelay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error in setdelay: {e}")
         await update.message.reply_text("❌ Failed to update delay")
 
-
-async def receive_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle the received message for setmsg."""
-    try:
-        # Check admin permission again for safety
-        if not is_admin(update.effective_user.id):
-            return ConversationHandler.END
-
-        new_message = update.message.text
-        
-        # Update global settings first
-        settings = update_global_settings(message=new_message)
-        
-        # Then update running tasks
-        from scheduler import scheduler
-        updated_count = await scheduler.update_running_tasks(context.bot, new_message=new_message)
-        
-        await update.message.reply_text(
-            f"✅ Global message updated!\n"
-            f"New message: {settings['message']}\n"
-            f"Updated {updated_count} running tasks"
-        )
-        return ConversationHandler.END
-
-    except Exception as e:
-        logger.error(f"Error updating message: {e}")
-        await update.message.reply_text("❌ Failed to update message")
-        return ConversationHandler.END
-
 async def startall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start message loop in all manually stopped groups (Admin only)."""
     try:
@@ -264,7 +241,7 @@ async def startall(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 success = await schedule_message(
                     context.bot,
                     group_id,
-                    message=settings["message"],
+                    message_reference=settings.get("message_reference"),  # Use message_reference
                     delay=settings["delay"]
                 )
                 if success:

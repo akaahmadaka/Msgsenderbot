@@ -44,42 +44,52 @@ class MessageScheduler:
         except Exception:
             return current_time + timedelta(seconds=delay)
         
-    async def schedule_message(self, bot, group_id: str, message: Optional[str] = None, delay: Optional[int] = None):
+    async def schedule_message(
+        self, 
+        bot, 
+        group_id: str, 
+        message_reference: Optional[dict] = None, 
+        delay: Optional[int] = None
+    ):
+        """Schedule messages for a group."""
         try:
             data = load_data()
             settings = get_global_settings()
             
             if group_id not in data["groups"]:
-                logger.error(f"Cannot start loop - Group {group_id} not found in database")
+                logger.error(f"Cannot start loop - Group {group_id} not found")
                 return False
                 
-            message = message or settings["message"]
-            delay = delay or settings["delay"]
+            message_ref = message_reference or settings.get("message_reference")
+            if not message_ref:
+                logger.error("No message reference found")
+                return False
+                
+            delay_val = delay or settings["delay"]
             
             await self.remove_scheduled_job(group_id)
             
-            # Set initial next schedule to current time so first message sends immediately
+            # Set initial next schedule
             next_time = datetime.now(pytz.UTC)
-            update_group_message(group_id, data["groups"][group_id].get("last_msg_id"), next_time)
+            update_group_message(group_id, None, next_time)
             
             update_group_status(group_id, True)
             self.tasks[group_id] = asyncio.create_task(
-                self._message_loop(bot, group_id, message, delay)
+                self._message_loop(bot, group_id, message_ref, delay_val)
             )
             logger.info(f"Started message loop for group {group_id}")
             return True
             
         except Exception as e:
-            logger.error(f"Failed to schedule messages for group {group_id} - {str(e)}")
+            logger.error(f"Failed to schedule messages for group {group_id}: {e}")
             return False
-            
-    async def _message_loop(self, bot, group_id: str, message: str, delay: int):
+
+    async def _message_loop(self, bot, group_id: str, message_reference: dict, delay: int):
         """Message loop that sends first message immediately then follows delay."""
         retry_count = 0
         max_retries = 3
-        first_run = True  # Flag for first message
+        first_run = True
         
-        # For Python < 3.11, use async_timeout instead
         if sys.version_info < (3, 11):
             from async_timeout import timeout
         else:
@@ -93,25 +103,28 @@ class MessageScheduler:
                     break
 
                 try:
-                    # For first message, send immediately without delay
+                    # Handle timing for non-first messages
                     if not first_run:
                         current_time = datetime.now(pytz.UTC)
                         next_schedule_str = data["groups"][group_id].get("next_schedule")
-                        next_time = self.calculate_next_schedule(current_time, next_schedule_str, delay)
+                        next_time = self.calculate_next_schedule(
+                            current_time, 
+                            next_schedule_str, 
+                            delay
+                        )
                         wait_time = (next_time - current_time).total_seconds()
                         
                         if wait_time > 0:
                             await asyncio.sleep(wait_time)
 
-                    # Set first_run to False after first iteration
                     first_run = False
 
-                    async with timeout(30):  # 30 second timeout for message operations
-                        # Send new message
-                        sent_message = await bot.send_message(
-                            chat_id=int(group_id), 
-                            text=message,
-                            parse_mode="HTML"  # Since we're storing HTML format
+                    async with timeout(30):
+                        # Forward the message
+                        sent_message = await bot.copy_message(
+                            chat_id=int(group_id),
+                            from_chat_id=message_reference["chat_id"],
+                            message_id=message_reference["message_id"]
                         )
                         
                         # Try to delete previous message
@@ -123,120 +136,41 @@ class MessageScheduler:
                                     message_id=last_msg_id
                                 )
                             except Exception as del_err:
-                                logger.warning(f"Could not delete previous message in {group_id}: {del_err}")
+                                logger.warning(
+                                    f"Could not delete previous message in {group_id}: {del_err}"
+                                )
                         
-                        # Calculate and set next schedule
+                        # Update next schedule
                         next_time = datetime.now(pytz.UTC) + timedelta(seconds=delay)
-                        update_group_message(group_id, sent_message.message_id, next_time)
-                        retry_count = 0  # Reset retry count after successful message
+                        update_group_message(
+                            group_id, 
+                            sent_message.message_id, 
+                            next_time
+                        )
+                        retry_count = 0
 
-                except Forbidden as e:
-                    error_msg = str(e).lower()
-                    if "bot was kicked" in error_msg:
-                        logger.error(f"Bot kicked from group {group_id} - Removing group")
-                        await self.handle_critical_error(group_id, "Bot kicked", False)
-                    elif "user is deactivated" in error_msg:
-                        logger.error(f"Group {group_id} was deleted - Removing group")
-                        await self.handle_critical_error(group_id, "Group deleted", False)
-                    else:
-                        logger.error(f"Bot blocked in group {group_id} - Removing group")
-                        await self.handle_critical_error(group_id, "Bot blocked", False)
-                    break
-                    
-                except ChatMigrated as e:
-                    new_chat_id = e.new_chat_id
-                    logger.info(f"Group {group_id} migrated → {new_chat_id}")
-                    await self.handle_group_migration(bot, group_id, new_chat_id)
-                    break
-                    
-                except BadRequest as e:
-                    error_msg = str(e).lower()
-                    if "chat not found" in error_msg:
-                        logger.error(f"Group {group_id} not found - Removing group")
-                        await self.handle_critical_error(group_id, "Group not found", False)
-                    elif "not enough rights" in error_msg:
-                        logger.error(f"Bot restricted in group {group_id} - Attempting to leave")
-                        await self.handle_restriction(bot, group_id)
-                    elif "bot was kicked" in error_msg:
-                        logger.error(f"Bot kicked from group {group_id} - Removing group")
-                        await self.handle_critical_error(group_id, "Bot kicked", False)
-                    else:
-                        logger.error(f"Error in group {group_id} - {str(e)}")
-                        await self.handle_critical_error(group_id, str(e), False)
-                    break
-                    
-                except (NetworkError, asyncio.TimeoutError) as e:
+                except Exception as e:
                     retry_count += 1
-                    error_type = "Network error" if isinstance(e, NetworkError) else "Timeout error"
-                    
                     if retry_count <= max_retries:
-                        logger.warning(f"{error_type} in group {group_id} - Retry {retry_count}/{max_retries}")
-                        await asyncio.sleep(5 * retry_count)  # Exponential backoff
+                        logger.warning(
+                            f"Error in group {group_id} - Retry {retry_count}/{max_retries}"
+                        )
+                        await asyncio.sleep(5 * retry_count)
                         continue
                     else:
-                        logger.error(f"{error_type} in group {group_id} - Max retries reached")
-                        await self.handle_error(group_id)
-                        break
-                
+                        raise
+
             except Exception as e:
-                logger.error(f"Unexpected error in group {group_id} - {str(e)}")
-                await self.handle_critical_error(group_id, str(e), False)
+                logger.error(f"Loop error in group {group_id}: {e}")
+                await self.handle_error(group_id)
                 break
-
-    async def handle_restriction(self, bot, group_id: str):
-        try:
-            logger.info(f"Leaving group {group_id}")
-            try:
-                await bot.leave_chat(chat_id=int(group_id))
-                logger.info(f"Left group {group_id} successfully")
-            except Exception as e:
-                logger.error(f"Failed to leave group {group_id} - {str(e)}")
-            
-            logger.info(f"Removing group {group_id} details")
-            await self.handle_critical_error(group_id, "Bot restricted and left", False)
-            
-        except Exception as e:
-            logger.error(f"Failed to handle restriction for group {group_id} - {str(e)}")
-
-    async def handle_group_migration(self, bot, old_group_id: str, new_group_id: str):
-        try:
-            logger.info(f"Updating group {old_group_id} → {new_group_id}")
-            data = load_data()
-            
-            if old_group_id in data["groups"]:
-                data["groups"][new_group_id] = data["groups"][old_group_id]
-                del data["groups"][old_group_id]
-                save_data(data)
-                
-                await self.remove_scheduled_job(old_group_id)
-                await self.schedule_message(bot, new_group_id)
-                logger.info(f"Group migration completed")
-            
-        except Exception as e:
-            logger.error(f"Migration failed - {str(e)}")
-            await self.handle_critical_error(old_group_id, "Migration failed", False)
-
-    async def handle_critical_error(self, group_id: str, reason: str, should_retry: bool = False):
-        try:
-            if not should_retry:
-                update_group_status(group_id, False)
-                remove_group(group_id)
-                await self.remove_scheduled_job(group_id)
-                logger.info(f"Removed group {group_id}")
-            else:
-                update_group_status(group_id, False)
-                await self.remove_scheduled_job(group_id)
-                logger.warning(f"Temporary error for group {group_id} - Will retry")
-                
-        except Exception as e:
-            logger.error(f"Failed to handle error for group {group_id} - {str(e)}")
 
     async def handle_error(self, group_id: str):
         try:
             update_group_status(group_id, False)
             await self.remove_scheduled_job(group_id)
         except Exception as e:
-            logger.error(f"Error handler failed for group {group_id} - {str(e)}")
+            logger.error(f"Error handler failed for group {group_id}: {e}")
 
     async def remove_scheduled_job(self, group_id: str):
         if group_id in self.tasks:
@@ -245,9 +179,9 @@ class MessageScheduler:
                 await asyncio.sleep(0.1)
                 del self.tasks[group_id]
             except Exception as e:
-                logger.error(f"Failed to remove task for group {group_id} - {str(e)}")
+                logger.error(f"Failed to remove task for group {group_id}: {e}")
 
-    async def update_running_tasks(self, bot, new_message: Optional[str] = None, new_delay: Optional[int] = None):
+    async def update_running_tasks(self, bot, new_message_reference: Optional[dict] = None, new_delay: Optional[int] = None):
         """Update all running tasks with new settings."""
         try:
             data = load_data()
@@ -269,7 +203,7 @@ class MessageScheduler:
                         self._message_loop(
                             bot,
                             group_id,
-                            new_message or settings["message"],
+                            new_message_reference or settings.get("message_reference"),
                             new_delay or settings["delay"]
                         )
                     )
@@ -325,14 +259,14 @@ class MessageScheduler:
                     
                     # Store group info for later task creation
                     self.pending_groups[group_id] = {
-                        "message": settings["message"],
+                        "message_reference": settings.get("message_reference"),
                         "delay": settings["delay"],
                         "next_time": next_time  # Store the calculated next time
                     }
                 
             logger.info(f"Scheduler initialized - {len(self.pending_groups)} active groups pending")
         except Exception as e:
-            logger.error(f"Scheduler start failed - {str(e)}")
+            logger.error(f"Scheduler start failed: {e}")
 
     async def initialize_pending_tasks(self, bot):
         """Initialize tasks for recovered groups with bot instance."""
@@ -349,7 +283,7 @@ class MessageScheduler:
                         self._delayed_message_loop(
                             bot,
                             group_id,
-                            settings["message"],
+                            settings["message_reference"],
                             settings["delay"],
                             initial_delay=wait_time
                         )
@@ -360,7 +294,7 @@ class MessageScheduler:
                         self._message_loop(
                             bot,
                             group_id,
-                            settings["message"],
+                            settings["message_reference"],
                             settings["delay"]
                         )
                     )
@@ -373,15 +307,14 @@ class MessageScheduler:
             logger.error(f"Failed to initialize pending tasks: {e}")
             return 0
 
-    # Add new helper method for delayed start
-    async def _delayed_message_loop(self, bot, group_id: str, message: str, delay: int, initial_delay: float):
+    async def _delayed_message_loop(self, bot, group_id: str, message_reference: dict, delay: int, initial_delay: float):
         """Message loop with initial delay for recovered tasks."""
         try:
             # Wait for the initial delay
             await asyncio.sleep(initial_delay)
             
             # Then start the regular message loop
-            await self._message_loop(bot, group_id, message, delay)
+            await self._message_loop(bot, group_id, message_reference, delay)
         except Exception as e:
             logger.error(f"Delayed message loop failed for group {group_id}: {e}")
 
@@ -393,14 +326,14 @@ class MessageScheduler:
             self.tasks.clear()
             logger.info(f"Scheduler stopped - {task_count} tasks cancelled")
         except Exception as e:
-            logger.error(f"Scheduler shutdown failed - {str(e)}")
+            logger.error(f"Scheduler shutdown failed: {e}")
 
 # Global scheduler instance
 scheduler = MessageScheduler()
 
 # Public interface
-async def schedule_message(bot, group_id, message=None, delay=None):
-    return await scheduler.schedule_message(bot, group_id, message, delay)
+async def schedule_message(bot, group_id, message_reference=None, delay=None):
+    return await scheduler.schedule_message(bot, group_id, message_reference, delay)
 
 async def remove_scheduled_job(group_id):
     await scheduler.remove_scheduled_job(group_id)
