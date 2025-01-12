@@ -117,7 +117,6 @@ class MessageScheduler:
                     first_run = False
 
                     async with timeout(30):
-                        # Try to send message
                         try:
                             sent_message = await bot.copy_message(
                                 chat_id=int(group_id),
@@ -136,64 +135,88 @@ class MessageScheduler:
                                 "bot was kicked",
                                 "not enough rights",
                                 "chat_write_forbidden",
-                                "The message can't be copied",
+                                "the message can't be copied",
                                 "chat_send_plain_forbidden"
                             ]):
-                                # Remove all data immediately
-                                await self.remove_scheduled_job(group_id)  # Cancel the task first
-                                remove_group(group_id)  # Remove from data file
-                                logger.info(f"Removed group {group_id} due to: {str(e)}")
+                                # First update the group status to inactive
+                                update_group_status(group_id, False)
+                                
+                                try:
+                                    # Then remove the scheduled job
+                                    await self.remove_scheduled_job(group_id)
+                                    # Finally remove the group data
+                                    remove_group(group_id)
+                                    logger.info(f"Successfully removed group {group_id} due to: {str(e)}")
+                                except Exception as cleanup_error:
+                                    logger.error(f"Error during cleanup for group {group_id}: {cleanup_error}")
                                 return  # Exit the loop completely
                             raise  # Re-raise other errors
-                        
+                            
                         # Message sent successfully - try to delete previous
                         last_msg_id = data["groups"][group_id].get("last_msg_id")
                         if last_msg_id:
                             try:
-                                await bot.delete_message(
-                                    chat_id=int(group_id),
-                                    message_id=last_msg_id
-                                )
-                            except Exception as del_err:
-                                logger.warning(f"Could not delete message in {group_id}: {del_err}")
+                                await bot.delete_message(int(group_id), last_msg_id)
+                            except Exception as e:
+                                logger.warning(f"Failed to delete previous message: {e}")
                         
-                        # Update next schedule
+                        # Update group data
+                        retry_count = 0  # Reset retry count on success
                         next_time = datetime.now(pytz.UTC) + timedelta(seconds=delay)
                         update_group_message(group_id, sent_message.message_id, next_time)
-                        retry_count = 0
 
-                except (NetworkError, asyncio.TimeoutError) as e:
+                except asyncio.TimeoutError:
+                    logger.error(f"Timeout sending message to group {group_id}")
                     retry_count += 1
-                    if retry_count <= max_retries:
-                        logger.warning(f"Network error in group {group_id} - Retry {retry_count}/{max_retries}")
-                        await asyncio.sleep(5 * retry_count)
-                        continue
-                    else:
-                        logger.error(f"Network error persists in group {group_id} - Stopping loop")
-                        # Remove all data after max retries
+                    if retry_count >= max_retries:
                         await self.remove_scheduled_job(group_id)
-                        remove_group(group_id)
-                        logger.info(f"Removed group {group_id} due to persistent network errors")
-                        return  # Exit the loop completely
+                        return
+                    continue
 
             except Exception as e:
-                logger.error(f"Unexpected error in group {group_id}: {str(e)}")
-                # Remove all data for any unexpected error
-                await self.remove_scheduled_job(group_id)
-                remove_group(group_id)
-                logger.info(f"Removed group {group_id} due to unexpected error")
-                return  # Exit the loop completely
+                logger.error(f"Unexpected error in message loop: {e}")
+                retry_count += 1
+                if retry_count >= max_retries:
+                    await self.remove_scheduled_job(group_id)
+                    return
+                await asyncio.sleep(5)
 
     async def remove_scheduled_job(self, group_id: str):
         """Remove a scheduled job and ensure it's cancelled."""
         if group_id in self.tasks:
             try:
-                self.tasks[group_id].cancel()  # Cancel the task
-                await asyncio.sleep(0.1)  # Small delay to ensure cancellation
+                task = self.tasks[group_id]
+                if not task.done():
+                    task.cancel()  # Cancel the task if it's not already done
+                    try:
+                        await task  # Wait for cancellation to complete
+                    except asyncio.CancelledError:
+                        pass  # This is expected
+                    except Exception as e:
+                        logger.warning(f"Error while waiting for task cancellation: {e}")
+                
                 del self.tasks[group_id]  # Remove from tasks dict
-                logger.info(f"Cancelled scheduled task for group {group_id}")
+                logger.info(f"Successfully cancelled scheduled task for group {group_id}")
             except Exception as e:
                 logger.error(f"Error cancelling task for group {group_id}: {e}")
+                # Force remove the task from the dictionary even if cancellation failed
+                self.tasks.pop(group_id, None)
+
+    async def cleanup_group(self, group_id: str, reason: str):
+        """Cleanup all resources for a group in the correct order."""
+        try:
+            # First mark the group as inactive
+            update_group_status(group_id, False)
+            
+            # Then remove the scheduled job
+            await self.remove_scheduled_job(group_id)
+            
+            # Finally remove the group data
+            remove_group(group_id)
+            
+            logger.info(f"Completed cleanup for group {group_id}. Reason: {reason}")
+        except Exception as e:
+            logger.error(f"Error during cleanup for group {group_id}: {e}")
 
     async def handle_group_migration(self, bot, old_group_id: str, new_group_id: str):
         """Handle group migration by updating group ID."""
