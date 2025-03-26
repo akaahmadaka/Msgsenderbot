@@ -3,49 +3,32 @@ import asyncio
 import signal
 import sys
 import logging
+import subprocess
 from telegram.ext import Application, CommandHandler, filters, ConversationHandler, MessageHandler
 from handlers import (
-    start, startloop, stoploop,
-    setmsg, setdelay, status,
+    start,  
+    toggle_loop, setmsg, setdelay, status,
     startall, stopall, WAITING_FOR_MESSAGE, receive_new_message, cancel
 )
 from scheduler import start_scheduler, stop_scheduler, scheduler
 from config import BOT_TOKEN
-from utils import get_global_settings
+from db import initialize_database  # Import database functions
+from logger_config import setup_logger
 
-# Disable all external loggers
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.WARNING)
-logging.getLogger("apscheduler").setLevel(logging.WARNING)
-
-# Configure simple logging
-class SimpleFormatter(logging.Formatter):
-    def format(self, record):
-        return f"{record.getMessage()}"
-
-handler = logging.StreamHandler(sys.stdout)
-handler.setFormatter(SimpleFormatter())
-
-logging.basicConfig(
-    level=logging.INFO,
-    handlers=[handler]
-)
+# Setup logger
+setup_logger()
 logger = logging.getLogger(__name__)
 
 class Bot:
     def __init__(self):
-        """Initialize bot"""
         try:
             self.app = Application.builder().token(BOT_TOKEN).build()
+            
+            # Initialize database before handlers
+            initialize_database()
             self.is_running = False
-            self.setup_handlers()
-        except Exception as e:
-            logger.error(f"Init failed: {e}")
-            raise
-
-    def setup_handlers(self):
-        """Setup command handlers"""
-        try:
+        
+            # Setup handlers
             # Create conversation handler for setmsg
             conv_handler = ConversationHandler(
                 entry_points=[CommandHandler("setmsg", setmsg)],
@@ -60,8 +43,8 @@ class Bot:
             # Define regular handlers with their filters
             handlers = [
                 ("start", start, filters.ChatType.PRIVATE | (filters.ChatType.GROUPS & filters.Regex(r"startloop"))),
-                ("startloop", startloop, None),
-                ("stoploop", stoploop, None),
+                ("startloop", lambda update, context: toggle_loop(update, context, True), None),
+                ("stoploop", lambda update, context: toggle_loop(update, context, False), None),
                 ("setdelay", setdelay, None),
                 ("status", status, None),
                 ("startall", startall, filters.ChatType.PRIVATE),
@@ -81,7 +64,6 @@ class Bot:
         except Exception as e:
             logger.error(f"Handler setup failed: {e}")
             raise
-
     async def error_handler(self, update, context):
         """Handle errors"""
         logger.error(f"Error: {context.error}")
@@ -96,6 +78,7 @@ class Bot:
 
             # Initialize and start application
             await self.app.initialize()
+            logger.debug('After initialize, before start')
             await self.app.start()
 
             self.is_running = True
@@ -104,6 +87,7 @@ class Bot:
             recovered_count = await scheduler.initialize_pending_tasks(self.app.bot)
 
             # Start polling with specific updates
+            logger.debug(f'Updater before polling: {self.app.updater}')
             await self.app.updater.start_polling(
                 allowed_updates=["message", "callback_query"],
                 drop_pending_updates=True
@@ -139,20 +123,34 @@ class Bot:
         except Exception as e:
             logger.error(f"Stop failed: {e}")
 
-def setup_signal_handlers(bot):
-    """Setup signal handlers for graceful shutdown"""
-    def signal_handler(signum, frame):
-        bot.is_running = False
-
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, signal_handler)
+def install_dependencies():
+    """Install dependencies from requirements.txt, upgrading if already installed."""
+    try:
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-U', '-r', 'requirements.txt'])
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to install dependencies: {e}")
+        sys.exit(1)
 
 async def main():
     """Main function"""
     bot = None
+    loop = asyncio.get_running_loop()  # Use get_running_loop
+
     try:
+        try:
+            pass
+        except ImportError:
+            logger.info("The 'telegram' module is not installed. Attempting to install it...")
+            install_dependencies()
+
+        # Initialize the database (create tables)
+        initialize_database()
+
         bot = Bot()
-        setup_signal_handlers(bot)
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(
+                sig, lambda: asyncio.create_task(bot.stop())
+            )
         await bot.start()
     except (KeyboardInterrupt, SystemExit):
         logger.info("Received shutdown signal")

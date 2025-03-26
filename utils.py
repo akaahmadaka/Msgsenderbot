@@ -1,149 +1,257 @@
 # utils.py
-import json
+import sqlite3
+import time
 import os
 import logging
 from datetime import datetime
 import pytz
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-DATA_FILE = "data.json"
-
-def load_data():
-    """Load group data from the JSON file."""
+from db import get_db_connection, DB_FILE
+from logger_config import setup_logger
+def get_global_settings(cursor):
+    """Retrieve global settings from the database."""
     try:
-        if not os.path.exists(DATA_FILE):
-            default_data = {
-                "global_settings": {
-                    "message": "Default message",
-                    "delay": 3600,
-                    "message_reference": None  # Added message_reference
-                },
-                "groups": {}
-            }
-            save_data(default_data)
-            return default_data
-            
-        with open(DATA_FILE, "r") as file:
-            return json.load(file)
-    except Exception as e:
-        logger.error(f"Error loading data: {e}")
-        return {
-            "global_settings": {
-                "message": "Default message",
-                "delay": 3600,
-                "message_reference": None  # Added message_reference
-            },
-            "groups": {}
+        # Load global settings
+        cursor.execute("SELECT message, delay, message_reference_chat_id, message_reference_message_id FROM GLOBAL_SETTINGS WHERE id = 1")
+        global_settings_row = cursor.fetchone()
+
+        # Get column names from cursor.description
+        column_names = [desc[0] for desc in cursor.description]
+
+        # Convert the tuple to a dictionary with nested message_reference
+        global_settings = dict(zip(column_names, global_settings_row))
+        global_settings["message_reference"] = {
+            "chat_id": global_settings["message_reference_chat_id"],
+            "message_id": global_settings["message_reference_message_id"]
         }
+        del global_settings["message_reference_chat_id"]
+        del global_settings["message_reference_message_id"]
 
-def save_data(data):
-    """Save group data to the JSON file."""
-    try:
-        with open(DATA_FILE, "w") as file:
-            json.dump(data, file, indent=4)
-    except Exception as e:
-        logger.error(f"Error saving data: {e}")
+        return global_settings
+    except sqlite3.Error as e:
+        logger.error(f"Error loading global settings from database: {e}")
         raise
 
-def add_group(group_id, group_name):
-    """Add a new group to the data file."""
+# Setup logger
+setup_logger()
+logger = logging.getLogger(__name__)
+
+# DATA_FILE = "data.json"
+
+# --- SQLite functions ---
+
+def load_data(cursor=None):
+    """Load all data from the database."""
     try:
-        data = load_data()
-        if group_id not in data["groups"]:
-            data["groups"][group_id] = {
-                "name": group_name,
-                "last_msg_id": None,
-                "next_schedule": None,  # Will be set when loop starts
-                "active": False,
-                "error_count": 0,
-                "error_state": False
+        # Manage connection only if no cursor provided
+        if cursor is None:
+            conn = get_db_connection()
+        else:
+            conn = None
+        cursor.execute("SELECT * FROM GROUPS")
+ 
+        groups_rows = cursor.fetchall()
+        column_names = [desc[0] for desc in cursor.description]
+        groups = {}
+        for raw_row in groups_rows:
+            row = dict(zip(column_names, raw_row))
+            groups[row["group_id"]] = {
+                "name": row["name"],
+                "last_msg_id": row["last_msg_id"],
+                "next_schedule": row["next_schedule"],
+                "active": bool(row["active"]),
+                "error_count": row["error_count"],
+                "error_state": bool(row["error_state"])
             }
-            save_data(data)
-        return data["groups"][group_id]
-    except Exception as e:
+
+        global_settings = get_global_settings(cursor)
+
+        if conn:  # Only close if we created the connection
+            conn.close()
+        
+        return {"global_settings": global_settings, "groups": groups}
+    except sqlite3.Error as e:
+        logger.error(f"Error loading data from database: {e}")
+        raise
+
+def save_data(data):
+    """Save all data to the database."""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+
+# Update global settings
+        global_settings = data["global_settings"]
+        message_reference = global_settings.get("message_reference")
+        cursor.execute("""
+            UPDATE GLOBAL_SETTINGS
+            SET message = ?, delay = ?, message_reference_chat_id = ?, message_reference_message_id = ?
+            WHERE id = 1
+        """, (global_settings["message"], global_settings["delay"],
+              message_reference["chat_id"] if message_reference else None,  # Maintain existing formatting
+              message_reference["message_id"] if message_reference else None))
+
+        # Get existing group IDs
+        cursor.execute("SELECT group_id FROM GROUPS")
+        existing_group_ids = {row["group_id"] for row in cursor.fetchall()}
+
+        # Update or insert groups
+        for group_id, group_data in data["groups"].items():
+            if group_id in existing_group_ids:
+                cursor.execute("""
+                    UPDATE GROUPS
+                    SET name = ?, last_msg_id = ?, next_schedule = ?, active = ?, error_count = ?, error_state = ?
+                    WHERE group_id = ?
+                """, (group_data["name"], group_data["last_msg_id"], group_data["next_schedule"],
+                      group_data["active"], group_data["error_count"], group_data["error_state"], group_id))
+                existing_group_ids.remove(group_id)  # Remove from set to track deletions
+            else:
+                cursor.execute("""
+                    INSERT INTO GROUPS (group_id, name, last_msg_id, next_schedule, active, error_count, error_state)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (group_id, group_data["name"], group_data["last_msg_id"], group_data["next_schedule"],
+                      group_data["active"], group_data["error_count"], group_data["error_state"]))
+
+        # Delete groups that are no longer present
+        for group_id in existing_group_ids:
+            cursor.execute("DELETE FROM GROUPS WHERE group_id = ?", (group_id,))
+
+        conn.commit()
+    except sqlite3.Error as e:
+        logger.error(f"Error saving data to database: {e}")
+        raise
+
+def add_group(group_id, group_name, cursor):
+    """Add a new group to the database."""
+    try:
+        cursor.execute("""
+            INSERT OR IGNORE INTO GROUPS 
+            (group_id, name, last_msg_id, next_schedule, active, error_count, error_state)
+            VALUES (?, ?, NULL, NULL, 0, 0, 0)
+        """, (group_id, group_name))
+    except sqlite3.Error as e:
         logger.error(f"Error adding group: {e}")
         raise
 
+
 def update_group_message(group_id, message_id, next_time):
     """Update group's message information with UTC datetime."""
-    try:
-        data = load_data()
-        if group_id in data["groups"]:
-            data["groups"][group_id]["last_msg_id"] = message_id
-            # Store as ISO format UTC datetime
-            data["groups"][group_id]["next_schedule"] = next_time.astimezone(pytz.UTC).isoformat()
-            save_data(data)
-            logger.info(f"Updated message info for group {group_id} - Next: {next_time.isoformat()}")
-            return True
-        return False
-    except Exception as e:
-        logger.error(f"Error updating message info: {e}")
-        return False
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                # Use immediate transaction mode for better concurrency
+                cursor.execute("BEGIN IMMEDIATE")
+                
+                cursor.execute("""
+                    UPDATE GROUPS
+                    SET last_msg_id = ?, next_schedule = ?
+                    WHERE group_id = ?
+                """, (message_id, next_time.astimezone(pytz.UTC).isoformat(), group_id))
+
+                conn.commit()
+                return  # Success
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e) and attempt < max_retries - 1:
+                wait_time = 0.1 * (attempt + 1)
+                logger.warning(f"Database locked, retrying in {wait_time}s... (Attempt {attempt + 1})")
+                time.sleep(wait_time)
+                continue
+            logger.error(f"Error updating message info after {max_retries} attempts: {e}")
+            raise
+
 
 def update_group_status(group_id: str, active: bool):
     """Update group's active status"""
-    try:
-        data = load_data()
-        if group_id in data["groups"]:
-            data["groups"][group_id]["active"] = active
-            save_data(data)
-            logger.info(f"Updated status for group {group_id} - Active: {active}")
-    except Exception as e:
-        logger.error(f"Failed to update group status - {str(e)}")
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                # Use immediate transaction mode for better concurrency
+                cursor.execute("BEGIN IMMEDIATE")
+                
+                cursor.execute("""
+                    UPDATE GROUPS
+                    SET active = ?
+                    WHERE group_id = ?
+                """, (int(active), group_id))
+
+                conn.commit()
+                logger.info(f"Updated status for group {group_id} - Active: {active}")
+                return  # Success
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e) and attempt < max_retries - 1:
+                wait_time = 0.1 * (attempt + 1)
+                logger.warning(f"Database locked, retrying in {wait_time}s... (Attempt {attempt + 1})")
+                time.sleep(wait_time)
+                continue
+            logger.error(f"Failed to update group status after {max_retries} attempts - {str(e)}")
+            raise
+
 
 def increment_error_count(group_id):
     """Increment group's error count."""
-    try:
-        data = load_data()
-        if group_id in data["groups"]:
-            data["groups"][group_id]["error_count"] += 1
-            save_data(data)
-            return data["groups"][group_id]["error_count"]
-        return 0
-    except Exception as e:
-        logger.error(f"Error incrementing error count: {e}")
-        return 0
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                # Use immediate transaction mode for better concurrency
+                cursor.execute("BEGIN IMMEDIATE")
+                
+                cursor.execute("""
+                    UPDATE GROUPS
+                    SET error_count = error_count + 1
+                    WHERE group_id = ?
+                """, (group_id,))
+
+                cursor.execute("SELECT error_count FROM GROUPS WHERE group_id = ?", (group_id,))
+                count = cursor.fetchone()["error_count"]
+
+                conn.commit()
+                return count
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e) and attempt < max_retries - 1:
+                wait_time = 0.1 * (attempt + 1)
+                logger.warning(f"Database locked, retrying in {wait_time}s... (Attempt {attempt + 1})")
+                time.sleep(wait_time)
+                continue
+            logger.error(f"Error incrementing error count after {max_retries} attempts: {e}")
+            raise
+
 
 def remove_group(group_id):
-    """Remove a group from the data file."""
+    """Remove a group from the database."""
     try:
-        data = load_data()
-        if group_id in data["groups"]:
-            del data["groups"][group_id]
-            save_data(data)
-            return True
-        return False
-    except Exception as e:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+
+            cursor.execute("DELETE FROM GROUPS WHERE group_id = ?", (group_id,))
+
+            conn.commit()
+    except sqlite3.Error as e:
         logger.error(f"Error removing group: {e}")
-        return False
+        raise
 
-def get_global_settings():
-    """Get global message and delay settings."""
-    data = load_data()
-    return data.get("global_settings", {
-        "message": "Default message",
-        "delay": 3600,
-        "message_reference": None  # Added message_reference
-    })
-
-def update_global_settings(message=None, delay=None, message_reference=None):
-    """Update global message and/or delay settings."""
+def get_group(group_id: str):
+    """Get a specific group's data."""
     try:
-        data = load_data()
-        if message is not None:
-            data["global_settings"]["message"] = message
-        if delay is not None:
-            data["global_settings"]["delay"] = delay
-        if message_reference is not None:  # Added message_reference handling
-            data["global_settings"]["message_reference"] = message_reference
-        save_data(data)
-        return data["global_settings"]
-    except Exception as e:
-        logger.error(f"Error updating global settings: {e}")
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT * FROM GROUPS WHERE group_id = ?", (group_id,))
+            row = cursor.fetchone()
+
+            return {
+                "name": row["name"],
+                "last_msg_id": row["last_msg_id"],
+                "next_schedule": row["next_schedule"],
+                "active": bool(row["active"]),
+                "error_count": row["error_count"],
+                "error_state": bool(row["error_state"])
+            }
+
+    except sqlite3.Error as e:
+        logger.error(f"Error getting group data: {e}")
         raise
