@@ -24,10 +24,9 @@ class Bot:
         try:
             self.app = Application.builder().token(BOT_TOKEN).build()
             
-            # Initialize database before handlers
-            initialize_database()
+            # Database will be initialized in main()
             self.is_running = False
-        
+
             # Setup handlers
             # Create conversation handler for setmsg
             conv_handler = ConversationHandler(
@@ -144,7 +143,7 @@ async def main():
             install_dependencies()
 
         # Initialize the database (create tables)
-        initialize_database()
+        await initialize_database() # Added await
 
         bot = Bot()
         for sig in (signal.SIGTERM, signal.SIGINT):

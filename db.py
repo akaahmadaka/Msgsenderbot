@@ -1,7 +1,9 @@
-import sqlite3
+# db.py
+import aiosqlite
 import logging
-from contextlib import contextmanager
+from contextlib import asynccontextmanager # Changed import
 import traceback
+import asyncio # Added import
 
 DB_FILE = "bot_data.db"
 
@@ -12,32 +14,38 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-@contextmanager
-def get_db_connection():
-    """Context manager for database connections."""
-    caller = traceback.extract_stack(limit=2)[0].name  # Get the name of the calling function
+@asynccontextmanager # Changed decorator
+async def get_db_connection(): # Changed to async def
+    """Async context manager for database connections."""
+    caller = traceback.extract_stack(limit=2)[0].name
     logger.debug(f"DB Connection: Opening for {caller}...")
-    conn = sqlite3.connect(DB_FILE, timeout=30, isolation_level='IMMEDIATE')
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 60000")
-    conn.execute("PRAGMA synchronous = NORMAL")  # More frequent checkpoints
-    conn.execute("PRAGMA wal_autocheckpoint = 100")
-    conn.execute("PRAGMA cache_size = -10000")  # 10MB cache
+    conn = None # Initialize conn
     try:
-        conn.row_factory = sqlite3.Row
-        yield conn
-    finally:
-        logger.debug(f"DB Connection: Closing for {caller}.")
-        conn.close()
+        conn = await aiosqlite.connect(DB_FILE, timeout=30, isolation_level='IMMEDIATE') # Changed to await aiosqlite.connect
+        await conn.execute("PRAGMA journal_mode = WAL") # Added await
+        await conn.execute("PRAGMA foreign_keys = ON") # Added await
+        await conn.execute("PRAGMA busy_timeout = 60000") # Added await
+        await conn.execute("PRAGMA synchronous = NORMAL") # Added await
+        await conn.execute("PRAGMA wal_autocheckpoint = 100") # Added await
+        await conn.execute("PRAGMA cache_size = -10000") # Added await
 
-def initialize_database():
-    """Initializes the database, creating tables if they don't exist."""
+        conn.row_factory = aiosqlite.Row # Use aiosqlite.Row
+        yield conn
+    except aiosqlite.Error as e: # Catch aiosqlite errors
+        logger.error(f"Database connection error for {caller}: {e}")
+        raise # Re-raise the exception
+    finally:
+        if conn:
+            logger.debug(f"DB Connection: Closing for {caller}.")
+            await conn.close() # Added await
+
+async def initialize_database(): # Changed to async def
+    """Initializes the database asynchronously, creating tables if they don't exist."""
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
+        async with get_db_connection() as conn: # Changed to async with
+            cursor = await conn.cursor() # Added await
             # Create GLOBAL_SETTINGS table
-            cursor.execute("""
+            await cursor.execute("""
             CREATE TABLE IF NOT EXISTS GLOBAL_SETTINGS (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 message TEXT,
@@ -45,9 +53,9 @@ def initialize_database():
                 message_reference_chat_id INTEGER,
                 message_reference_message_id INTEGER
             )
-            """)
+            """) # Added await
             # Create GROUPS table
-            cursor.execute("""
+            await cursor.execute("""
             CREATE TABLE IF NOT EXISTS GROUPS (
                 group_id TEXT PRIMARY KEY NOT NULL,
                 name TEXT NOT NULL,
@@ -57,18 +65,18 @@ def initialize_database():
                 error_count INTEGER DEFAULT 0,
                 error_state INTEGER DEFAULT 0
             )
-            """)
+            """) # Added await
             # Add default data to global_settings if it doesn't exist
-            cursor.execute("SELECT id FROM GLOBAL_SETTINGS WHERE id = 1")
-            if cursor.fetchone() is None:
-                cursor.execute("""
+            await cursor.execute("SELECT id FROM GLOBAL_SETTINGS WHERE id = 1") # Added await
+            if await cursor.fetchone() is None: # Added await
+                await cursor.execute("""
                 INSERT INTO GLOBAL_SETTINGS (id, message, delay, message_reference_chat_id, message_reference_message_id)
-                VALUES (1, 'Please set a message using /setmsg', 3600, 0, 0)""")
-            conn.commit()
+                VALUES (1, 'Please set a message using /setmsg', 3600, 0, 0)""") # Added await
+            await conn.commit() # Added await
+            await cursor.close() # Close cursor explicitly
             logger.debug("Database initialized successfully")
-    except sqlite3.Error as e:
+    except aiosqlite.Error as e: # Catch aiosqlite errors
         logger.error(f"Database initialization error: {e}")
         raise
 
-if __name__ == '__main__':
-    initialize_database()
+# Removed the if __name__ == '__main__': block

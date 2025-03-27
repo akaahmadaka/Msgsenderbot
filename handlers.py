@@ -3,7 +3,7 @@ from telegram import Update
 from telegram.ext import ContextTypes, CommandHandler, ConversationHandler, filters
 from utils import (
     load_data, add_group,
-    save_data, update_group_status, remove_group,
+    update_group_status, remove_group, # Removed save_data
     get_global_settings
 )
 from scheduler import (
@@ -62,31 +62,30 @@ async def toggle_loop(update: Update, context: ContextTypes.DEFAULT_TYPE, start:
                 return
 
             group_name = update.message.chat.title
-            
-            with get_db_connection() as conn:
-                cursor = conn.cursor()
-                try:
-                    add_group(group_id, group_name, cursor)
-                    settings = get_global_settings(cursor)
-                    conn.commit()
-                finally:
-                    conn.close()
 
-            success = await schedule_message(context.bot, group_id, settings.get("message_reference"), GLOBAL_DELAY)
+            settings = None # Initialize settings
+            async with get_db_connection() as conn: # Use async with
+                # No need for explicit cursor management here if utils functions handle it
+                await add_group(group_id, group_name) # Added await, removed cursor
+                settings = await get_global_settings() # Added await, removed cursor
+                # Commit is handled within add_group/get_global_settings if they create the connection
+
+            if not settings:
+                 logger.error(f"Failed to retrieve global settings for group {group_id}")
+                 await update.message.reply_text("❌ Failed to retrieve settings to start loop")
+                 return
+
+            success = await schedule_message(context.bot, group_id, settings.get("message_reference"), settings.get("delay", GLOBAL_DELAY)) # Use fetched delay
             if not success:
                 await update.message.reply_text("❌ Failed to start message loop")
                 return
 
             await update.message.reply_text("✅ Message loop started")
         else:
-            data = load_data()
+            # We don't need to load all data just to check existence and update status
+            # Let remove_scheduled_job handle the status update and removal logic internally
 
-            if group_id not in data["groups"]:
-                logger.info(f"Stop command failed - Group {group_id} not found in database")
-                await update.message.reply_text("❌ Group not found in database")
-                return
-
-            update_group_status(group_id, False)
+            # update_group_status(group_id, False) # Moved to scheduler.remove_scheduled_job/cleanup_group
             logger.info(f"Group {group_id} status updated to inactive")
 
             if not await remove_scheduled_job(group_id):
@@ -132,15 +131,14 @@ async def receive_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             "chat_id": update.effective_message.chat_id,
             "message_id": update.effective_message.message_id
         }
-        
-        # Update message in database
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            conn.execute("UPDATE GLOBAL_SETTINGS SET message_reference_chat_id = ?, message_reference_message_id = ? WHERE id = 1",
-                        (message_reference["chat_id"], message_reference["message_id"]))
-            conn.commit()
 
-        from scheduler import scheduler
+        # Update message in database asynchronously
+        async with get_db_connection() as conn: # Use async with
+            await conn.execute("UPDATE GLOBAL_SETTINGS SET message_reference_chat_id = ?, message_reference_message_id = ? WHERE id = 1",
+                        (message_reference["chat_id"], message_reference["message_id"])) # Added await
+            await conn.commit() # Added await
+
+        from scheduler import scheduler # Keep scheduler import here for now
         updated_count = await scheduler.update_running_tasks(
             context.bot,
             new_message_reference=message_reference
@@ -181,10 +179,10 @@ async def setdelay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Please provide a valid number!")
             return
 
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE GLOBAL_SETTINGS SET delay = ? WHERE id = 1", (new_delay,))
-            conn.commit()
+        # Update delay in database asynchronously
+        async with get_db_connection() as conn: # Use async with
+            await conn.execute("UPDATE GLOBAL_SETTINGS SET delay = ? WHERE id = 1", (new_delay,)) # Added await
+            await conn.commit() # Added await
 
            # Update running tasks
             from scheduler import scheduler
@@ -207,10 +205,11 @@ async def startall(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ This command only works in private chat!")
             return
 
-        data = load_data()
+        # Load data asynchronously
+        data = await load_data() # Added await
         settings = data["global_settings"]
         started_count = 0
-        
+
         # Get list of manually stopped groups
         for group_id, group in data["groups"].items():
             if not group.get("active", False) and not group.get("error_state", False):
@@ -245,18 +244,32 @@ async def stopall(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ This command only works in private chat!")
             return
 
-        data = load_data()
+        # Load data asynchronously
+        data = await load_data() # Added await
         stopped_count = 0
-        
-        # Get list of manually started groups
+
+        # Get list of manually started groups and stop them concurrently
+        tasks_to_remove = []
+        groups_to_stop_info = [] # Store name/id for logging
         for group_id, group in data["groups"].items():
             if group.get("active", False):
-                # Update group status to inactive
-                update_group_status(group_id, False)
-                # Stop the loop
-                await remove_scheduled_job(group_id)
-                stopped_count += 1
-                logger.info(f"Stopped loop in group {group['name']}")
+                # The status update is handled within remove_scheduled_job -> cleanup_group
+                tasks_to_remove.append(remove_scheduled_job(group_id))
+                groups_to_stop_info.append(group.get('name', group_id)) # For logging/reporting
+
+        stopped_count = 0 # Initialize count
+        if tasks_to_remove:
+            results = await asyncio.gather(*tasks_to_remove, return_exceptions=True)
+            for i, result in enumerate(results):
+                group_info = groups_to_stop_info[i]
+                if isinstance(result, Exception):
+                     # Log error but continue processing others
+                     logger.error(f"Failed to stop loop for group {group_info}: {result}")
+                else:
+                     # Assuming remove_scheduled_job doesn't return a specific success value we need to check
+                     stopped_count += 1
+                     logger.info(f"Stopped loop in group {group_info}")
+        # If no tasks were found, stopped_count remains 0
 
         if stopped_count > 0:
             await update.message.reply_text(f"✅ Successfully stopped message loop in {stopped_count} groups!")
@@ -275,10 +288,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Admin only command!")
             return
 
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            data = load_data(cursor)
-        
+        # Load data asynchronously
+        # No need for explicit connection/cursor management here if load_data handles it
+        data = await load_data() # Added await, removed cursor/conn usage
+
         # Count groups
         active_count = sum(1 for group in data["groups"].values() if group.get("active", False))
         total_count = len(data["groups"])
