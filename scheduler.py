@@ -3,17 +3,17 @@ import sys
 from datetime import datetime, timedelta
 from typing import Dict, Optional
 import pytz
-import aiosqlite # Changed import
+import aiosqlite
 from telegram.error import (
     Forbidden, BadRequest, NetworkError, ChatMigrated, RetryAfter
 )
 from db import get_db_connection
 from utils import (
     get_group,
-    remove_group,  # Keep remove_group
+    remove_group,
     get_global_settings, update_group_status,
     update_group_message, add_group,
-    load_data
+    load_data, update_group_retry_count
 )
 
 if sys.version_info >= (3, 11):
@@ -24,7 +24,6 @@ else:
 import logging
 from logger_config import setup_logger
 
-# Setup logger
 setup_logger()
 logger = logging.getLogger(__name__)
 
@@ -32,53 +31,66 @@ logger = logging.getLogger(__name__)
 class MessageScheduler:
     def __init__(self):
         self.tasks: Dict[str, asyncio.Task] = {}
-        self.pending_groups: Dict[str, dict] = {}  # Add this to store groups waiting for bot
+        self.pending_groups: Dict[str, dict] = {}
         logger.info("Scheduler ready")
 
     def calculate_next_schedule(self, current_time: datetime, next_schedule_str: Optional[str], delay: int) -> datetime:
         """Calculate the appropriate next schedule time."""
         try:
+            # Attempt to parse the ISO format string, handling potential 'Z' for UTC
             next_schedule = datetime.fromisoformat(next_schedule_str.replace('Z', '+00:00'))
+            # Ensure the parsed time is timezone-aware (assuming UTC if not specified)
+            if next_schedule.tzinfo is None:
+                next_schedule = pytz.utc.localize(next_schedule)
+            # Return the future schedule time or calculate based on delay if it's in the past
             return next_schedule if next_schedule > current_time else current_time + timedelta(seconds=delay)
         except (ValueError, TypeError):
-            return current_time + timedelta(seconds=delay)  # Default to delay if parsing fails
-        
+            # Default to delay from current time if parsing fails or input is invalid
+            return current_time + timedelta(seconds=delay)
+
     async def schedule_message(
-        self, 
-        bot, 
+        self,
+        bot,
         group_id: str,
-        message_reference: Optional[dict] = None, 
-        delay: Optional[int] = None
+        message_reference: Optional[dict] = None,
+        delay: Optional[int] = None,
+        existing_next_schedule: Optional[datetime] = None,
+        is_update_restart: bool = False
     ):
-        """Schedule messages for a group."""
+        """Schedule messages for a group, optionally preserving next schedule time."""
         try:
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    async with get_db_connection() as conn: # Use async with
-                        # Use await for async functions
-                        settings = await get_global_settings() # Removed cursor
+                    async with get_db_connection() as conn:
+                        settings = await get_global_settings()
 
-                        if group_id not in self.tasks:
-                            # Ensure group exists before scheduling
-                            await add_group(group_id, "Unknown Group") # Removed cursor
-
-                        message_ref = message_reference or settings.get("message_reference")
+                        message_ref = message_reference or settings["message_reference"]
                         if not message_ref:
                             logger.error(f"No message reference found for group {group_id}")
-                            return False # Indicate failure
+                            return False
 
-                        delay_val = delay if delay is not None else settings.get("delay")
+                        delay_val = delay if delay is not None else settings["delay"]
                         if delay_val is None:
                              logger.error(f"No delay value found for group {group_id}")
-                             return False # Indicate failure
+                             return False
 
-                        next_time = datetime.now(pytz.UTC)
-                        # Update DB asynchronously
-                        await update_group_message(group_id, None, next_time)
+                        current_time = datetime.now(pytz.UTC)
+                        if existing_next_schedule and existing_next_schedule > current_time:
+                            next_time = existing_next_schedule
+                            logger.debug(f"Using existing next schedule for group {group_id}: {next_time}")
+                        else:
+                            # If existing schedule is in the past or not provided, start "now" (or after a minimal delay if needed)
+                            # For simplicity, we set next_time to current_time, the loop logic handles the first immediate run.
+                            next_time = current_time
+                            logger.debug(f"Calculating new next schedule for group {group_id} based on current time.")
+
+                        group_data = await get_group(group_id)
+                        current_last_msg_id = group_data.get("last_msg_id") if group_data else None
+                        # Update DB with the calculated next_time and potentially existing last_msg_id
+                        await update_group_message(group_id, current_last_msg_id, next_time)
                         await update_group_status(group_id, True)
 
-                        # Cancel existing task if it exists before creating a new one
                         if group_id in self.tasks and not self.tasks[group_id].done():
                             self.tasks[group_id].cancel()
                             try:
@@ -88,223 +100,267 @@ class MessageScheduler:
                             except Exception as e_cancel:
                                 logger.error(f"Error cancelling existing task for {group_id}: {e_cancel}")
 
-
                         self.tasks[group_id] = asyncio.create_task(
-                            self._message_loop(bot, group_id, message_ref, delay_val)
+                            self._message_loop(bot, group_id, message_ref, delay_val, is_update_restart=is_update_restart)
                         )
-                        # Commit is handled within the utility functions now
                         logger.info(f"Started/Updated message loop for group {group_id}")
-                        return True # Indicate success
-                except aiosqlite.OperationalError as e: # Catch aiosqlite error
+                        return True
+                except aiosqlite.OperationalError as e:
                     if "database is locked" in str(e) and attempt < max_retries - 1:
                         wait_time = 0.1 * (attempt + 1)
                         logger.warning(f"Database locked on schedule_message, retrying in {wait_time}s... (Attempt {attempt + 1})")
-                        await asyncio.sleep(wait_time) # Use asyncio.sleep
-                        continue # Retry the loop
-                    else: # Max retries reached or different OperationalError
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
                          logger.error(f"Database operational error scheduling for group {group_id} after {attempt + 1} attempts: {e}")
-                         return False # Indicate failure
-                except Exception as e: # Catch other potential errors
+                         return False
+                except Exception as e:
                      logger.error(f"Unexpected error scheduling messages for group {group_id}: {e}")
-                     # Depending on the error, might want to update group status or cleanup
-                     # For now, just indicate failure
-                     return False # Indicate failure
+                     return False
 
-            # If loop finishes without success (e.g., max retries on lock)
             logger.error(f"Failed to schedule message for group {group_id} after {max_retries} attempts.")
             return False
 
-        # This part should ideally not be reached if the loop handles returns properly
         except Exception as e:
            logger.error(f"Failed to schedule messages for group {group_id}: {e}")
            raise
 
-    async def _send_and_delete_message(self, bot, group_id: str, message_reference: dict, group_data: dict):
-        """Send the message and delete the previous one."""
+    async def _send_and_delete_message(self, bot, group_id: str, group_name: str, message_reference: dict, group_data: dict):
+        """Send the message and delete the previous one. Handles fatal errors."""
+        FATAL_ERRORS = [
+            "chat not found",
+            "bot was kicked",
+            "user_is_blocked",
+            "peer_id_invalid",
+        ]
         try:
-            logger.debug(f'bot: {bot}, group_id: {group_id}, message_reference: {message_reference}, group_data: {group_data}')
+            logger.debug(f'Attempting to send message to group: {group_name} ({group_id})')
             sent_message = await bot.copy_message(
                 chat_id=int(group_id),
                 from_chat_id=message_reference["chat_id"],
                 message_id=message_reference["message_id"]
             )
 
-            # Message sent successfully - try to delete previous
             last_msg_id = group_data.get("last_msg_id")
             if last_msg_id:
                 try:
-                    logger.debug(f'bot: {bot}, group_id: {group_id}, last_msg_id: {last_msg_id}')
+                    logger.debug(f'Attempting delete of msg {last_msg_id} in group: {group_name} ({group_id})')
                     await bot.delete_message(int(group_id), last_msg_id)
-                except Exception as e:
-                    logger.warning(f"Failed to delete previous message: {e}")
+                except Exception as e_del:
+                    logger.warning(f"Failed to delete previous message {last_msg_id} in group {group_name} ({group_id}): {e_del}")
             return sent_message
+
         except (Forbidden, BadRequest, NetworkError, ChatMigrated, RetryAfter) as e:
             error_msg = str(e).lower()
-            logger.error(f"Telegram error in group {group_id}: {str(e)}")
+            logger.error(f"Telegram API error in group {group_name} ({group_id}): {str(e)}")
 
-            # Force cleanup for any permission/access error
-            if any(msg in error_msg for msg in [
-                "forbidden",
-                "not a member",
-                "chat not found",
-                "bot was kicked",
-                "not enough rights",
-                "chat_write_forbidden",
-                "the message can't be copied",
-                "chat_send_plain_forbidden",
-                "message to copy not found" # Add specific error for copy_message failure
-            ]):
-                logger.warning(f"Fatal Telegram error for group {group_id}, initiating cleanup: {str(e)}")
-                # Use the dedicated cleanup function which handles status update, task removal, and DB removal
-                asyncio.create_task(self.cleanup_group(group_id, f"Telegram API Error: {str(e)}"))
-                # No need to call update_group_status or remove_group directly here
-                # try:
-                #     await update_group_status(group_id, False) # Added await
-                #     await remove_group(group_id) # Added await
-                #     logger.info(f"Successfully removed group {group_id} due to: {str(e)}")
-                # except Exception as cleanup_error:
-                #     logger.error(f"Error during cleanup for group {group_id}: {cleanup_error}")
-                return None  # Fatal error - exit loop
-            raise  # Re-raise other exceptions for retry logic in _message_loop
+            if any(fatal_msg in error_msg for fatal_msg in FATAL_ERRORS):
+                logger.warning(f"Fatal Telegram error for group {group_name} ({group_id}), initiating cleanup: {str(e)}")
+                asyncio.create_task(self.cleanup_group(bot, group_id, f"Fatal Telegram Error: {str(e)}"))
+                return None
+
+            elif isinstance(e, ChatMigrated):
+                 new_chat_id = e.new_chat_id
+                 logger.info(f"Group {group_name} ({group_id}) migrated to supergroup {new_chat_id}. Handling migration.")
+                 asyncio.create_task(self.handle_group_migration(bot, group_id, str(new_chat_id)))
+                 return None
+
+            else:
+                 # Re-raise non-fatal, non-migration errors for retry logic
+                 raise e
+
+        except Exception as e:
+             logger.error(f"Unexpected error during send/delete for group {group_name} ({group_id}): {e}", exc_info=True)
+             raise e
 
 
-    async def _message_loop(self, bot, group_id: str, message_reference: dict, delay: int):
-        """Message loop that sends first message immediately then follows delay."""
-        retry_count = 0
-        max_retries = 3
-        first_run = True
+    async def _message_loop(self, bot, group_id: str, message_reference: dict, delay: int, is_update_restart: bool = False):
+        """Message loop handling retries, fatal errors, and cleanup."""
+        MAX_MESSAGE_RETRIES = 3
+        # is_initial_run is True only if it's the very first run after schedule_message (not an update restart)
+        is_initial_run = not is_update_restart
 
         while True:
+            group_name = f"ID:{group_id}"
             try:
-                # Fetch group data asynchronously
-                group_data = await get_group(group_id) # Added await
-                if not group_data or not group_data.get("active"): # Check .get("active") for safety
-                    logger.info(f"Loop stopping for group {group_id} - Group not found or inactive in DB.")
-                    # Ensure task is removed from internal tracking if it stops itself
-                    if group_id in self.tasks:
-                         del self.tasks[group_id]
-                    break # Exit the loop cleanly
+                group_data = await get_group(group_id)
+                if not group_data:
+                    logger.warning(f"Group {group_id} not found in DB during loop. Stopping task.")
+                    if group_id in self.tasks: del self.tasks[group_id]
+                    return
 
+                group_name = group_data.get("name", group_name)
+
+                if not group_data.get("active"):
+                    logger.info(f"Loop stopping for group {group_name} ({group_id}) - Marked inactive in DB.")
+                    if group_id in self.tasks: del self.tasks[group_id]
+                    return
+
+                current_retry_count = group_data.get("retry_count", 0)
+
+                # --- Wait Logic ---
+                # Determine if we should run immediately (only on the very first run after initial schedule)
+                run_immediately = is_initial_run
+
+                if not run_immediately:
+                    current_time = datetime.now(pytz.UTC)
+                    # Ensure next_schedule_dt is fetched correctly (should be datetime object from DB utils)
+                    next_schedule_dt = group_data.get("next_schedule")
+                    # Pass the datetime object directly if available
+                    next_time = self.calculate_next_schedule(current_time, next_schedule_dt.isoformat() if next_schedule_dt else None, delay)
+                    wait_time = (next_time - current_time).total_seconds()
+
+                    if wait_time > 0:
+                        logger.debug(f"Group {group_name} ({group_id}): Waiting {wait_time:.2f} seconds...")
+                        await asyncio.sleep(wait_time)
+                # After the first iteration (whether it waited or ran immediately), subsequent runs should always wait.
+                is_initial_run = False
+
+                # --- Send/Delete Logic ---
                 try:
-                    if not first_run:
-                        current_time = datetime.now(pytz.UTC)
-                        # group_data["next_schedule"] should be a datetime object from utils.get_group
-                        next_schedule_dt = group_data.get("next_schedule")
-                        # Pass datetime object directly if available, else None
-                        next_time = self.calculate_next_schedule(current_time, next_schedule_dt, delay)
-                        wait_time = (next_time - current_time).total_seconds()
+                    async with timeout(45):
+                        sent_message = await self._send_and_delete_message(
+                            bot, group_id, group_name, message_reference, group_data
+                        )
 
-                        if wait_time > 0:
-                            logger.debug(f"Group {group_id}: Waiting {wait_time:.2f} seconds...")
-                            await asyncio.sleep(wait_time)
-
-                    first_run = False
-
-                    # Timeout for the combined send/delete and DB update operation
-                    async with timeout(45): # Increased timeout slightly
-                        sent_message = await self._send_and_delete_message(bot, group_id, message_reference, group_data)
                         if sent_message is None:
-                            # Fatal error handled in _send_and_delete_message, cleanup initiated there.
-                            # Task should exit.
-                            logger.warning(f"Exiting loop for group {group_id} due to fatal error during send/delete.")
-                            if group_id in self.tasks: del self.tasks[group_id] # Ensure removal from tracking
-                            return # Exit the task
+                            logger.warning(f"Exiting loop for group {group_name} ({group_id}) due to fatal error.")
+                            return
 
-                        # Update group data asynchronously
-                        retry_count = 0  # Reset retry count on success
+                        # --- Success Case ---
+                        logger.info(f"Message sent successfully to {group_name} ({group_id}).")
+                        if current_retry_count > 0:
+                            await update_group_retry_count(group_id, 0)
+                            logger.info(f"Reset retry count for group {group_name} ({group_id}).")
+
                         next_time_update = datetime.now(pytz.UTC) + timedelta(seconds=delay)
-                        await update_group_message(group_id, sent_message.message_id, next_time_update) # Added await
+                        logger.debug(f"Attempting to update DB for group {group_id} with last_msg_id={sent_message.message_id}")
+                        await update_group_message(group_id, sent_message.message_id, next_time_update)
+                        logger.debug(f"Finished DB update for group {group_id} with last_msg_id={sent_message.message_id}")
 
-                except asyncio.TimeoutError:
-                    logger.error(f"Timeout during send/delete/update for group {group_id}")
-                    retry_count += 1 # Increment here
-                    if retry_count >= max_retries:
-                        logger.error(f"Max retries reached for group {group_id} due to timeout. Initiating cleanup.")
-                        await self.cleanup_group(group_id, "Timeout after max retries")
-                        return # Exit the task
-                    await asyncio.sleep(5 * retry_count) # Sleep here
+                # --- Retryable Error Handling ---
+                except (asyncio.TimeoutError, NetworkError, RetryAfter, Forbidden, BadRequest) as e:
+                    current_retry_count += 1
+                    logger.warning(f"Retryable error for group {group_name} ({group_id}) (Attempt {current_retry_count}/{MAX_MESSAGE_RETRIES}): {e}")
 
-                except aiosqlite.Error as db_err: # Catch database errors specifically
-                     logger.error(f"Database error in message loop for group {group_id}: {db_err}")
-                     retry_count += 1 # Increment here
-                     if retry_count >= max_retries:
-                         logger.error(f"Max retries reached for group {group_id} due to DB error. Initiating cleanup.")
-                         await self.cleanup_group(group_id, f"DB Error after max retries: {db_err}")
-                         return # Exit the task
-                     await asyncio.sleep(5 * retry_count) # Sleep here
+                    try:
+                        await update_group_retry_count(group_id, current_retry_count)
+                    except Exception as db_e:
+                        logger.error(f"Failed to update retry count for {group_name} ({group_id}) after error: {db_e}")
 
-                except Exception as e: # Catch other unexpected errors
-                    logger.error(f"Unexpected error in message loop for group {group_id}: {e}", exc_info=True)
-                    retry_count += 1 # Increment here
-                    if retry_count >= max_retries:
-                        logger.error(f"Max retries reached for group {group_id} due to unexpected error. Initiating cleanup.")
-                        await self.cleanup_group(group_id, f"Unexpected error after max retries: {e}")
-                        return # Exit the task
-                    await asyncio.sleep(5 * retry_count) # Sleep here
+                    if current_retry_count >= MAX_MESSAGE_RETRIES:
+                        logger.error(f"Max retries ({MAX_MESSAGE_RETRIES}) reached for group {group_name} ({group_id}). Error: {e}. Initiating leave and cleanup.")
+                        try:
+                            await bot.leave_chat(int(group_id))
+                            logger.info(f"Successfully left group {group_name} ({group_id}) after max retries.")
+                        except Exception as leave_e:
+                            logger.error(f"Failed to leave group {group_name} ({group_id}) after max retries: {leave_e}")
+                        await self.cleanup_group(bot, group_id, f"Max retries reached (leave attempted): {e}")
+                        return
+                    else:
+                        logger.info(f"Will retry for group {group_name} ({group_id}) on next schedule.")
+                        pass # Continue loop to wait for the next calculated schedule time
 
-            # Add except block for the outer try (line 178)
+                except aiosqlite.Error as db_err:
+                     logger.error(f"Database error during message loop for group {group_name} ({group_id}): {db_err}")
+                     await asyncio.sleep(5) # Short sleep before trying again
+
+                except Exception as e:
+                    current_retry_count += 1
+                    logger.error(f"Unexpected error in loop for group {group_name} ({group_id}) (Attempt {current_retry_count}/{MAX_MESSAGE_RETRIES}): {e}", exc_info=True)
+                    try:
+                        await update_group_retry_count(group_id, current_retry_count)
+                    except Exception as db_e:
+                         logger.error(f"Failed to update retry count for {group_name} ({group_id}) after unexpected error: {db_e}")
+
+                    if current_retry_count >= MAX_MESSAGE_RETRIES:
+                        logger.error(f"Max retries ({MAX_MESSAGE_RETRIES}) reached for group {group_name} ({group_id}) due to unexpected error. Initiating leave and cleanup.")
+                        try:
+                            await bot.leave_chat(int(group_id))
+                            logger.info(f"Successfully left group {group_name} ({group_id}) after max retries (unexpected error).")
+                        except Exception as leave_e:
+                            logger.error(f"Failed to leave group {group_name} ({group_id}) after max retries (unexpected error): {leave_e}")
+                        await self.cleanup_group(bot, group_id, f"Max retries reached (unexpected, leave attempted): {e}")
+                        return
+                    else:
+                        logger.info(f"Will retry for group {group_name} ({group_id}) on next schedule after unexpected error.")
+                        pass # Continue loop
+
+            # --- Outer Loop Error Handling ---
             except Exception as outer_e:
-                logger.error(f"Critical error in outer message loop for group {group_id}: {outer_e}", exc_info=True)
-                # Attempt cleanup on any outer loop error
-                await self.cleanup_group(group_id, f"Outer loop error: {outer_e}")
-                break # Exit the while loop
+                logger.error(f"Critical error in outer message loop for group {group_name} ({group_id}): {outer_e}", exc_info=True)
+                await self.cleanup_group(bot, group_id, f"Outer loop error: {outer_e}")
+                return
 
-    async def cleanup_group(self, group_id: str, reason: str):
-        """Cleanup all resources for a group in the correct order."""
-        # Ensure this function is idempotent and handles potential errors gracefully
-        logger.info(f"Starting cleanup for group {group_id}. Reason: {reason}")
+    async def cleanup_group(self, bot, group_id: str, reason: str):
+        """Cleanup resources, potentially leaving the chat first."""
+        group_name = f"ID:{group_id}"
         try:
-            # 1. Cancel and remove the asyncio task
+            group_data = await get_group(group_id)
+            if group_data:
+                group_name = group_data.get("name", group_name)
+        except Exception as e_get:
+            logger.warning(f"Could not fetch group name for {group_id} during cleanup: {e_get}")
+
+        logger.info(f"Starting cleanup for group {group_name} ({group_id}). Reason: {reason}")
+        try:
+            # Attempt to leave chat only if cleanup is due to errors (not manual stop)
+            if ("Max retries reached" in reason or "Fatal Telegram Error" in reason) and "leave attempted" not in reason:
+                try:
+                    logger.info(f"Attempting to leave group {group_name} ({group_id})...")
+                    await bot.leave_chat(int(group_id))
+                    logger.info(f"Successfully left group {group_name} ({group_id}).")
+                except Exception as leave_e:
+                    logger.error(f"Failed to leave group {group_name} ({group_id}): {leave_e}")
+
+            # Cancel and remove the asyncio task
             if group_id in self.tasks:
-                task = self.tasks.pop(group_id) # Remove from dict immediately
+                task = self.tasks.pop(group_id)
                 if not task.done():
                     task.cancel()
                     try:
-                        await task # Allow cancellation to propagate
+                        await task
                     except asyncio.CancelledError:
                         logger.debug(f"Task for group {group_id} cancelled successfully.")
                     except Exception as e_cancel:
-                        # Log error but continue cleanup
                         logger.error(f"Error awaiting cancelled task for group {group_id}: {e_cancel}")
             else:
-                 logger.debug(f"No active task found for group {group_id} during cleanup.")
+                 logger.debug(f"No active task found for group {group_name} ({group_id}) during cleanup.")
 
-            # 2. Mark the group as inactive in the database
+            # Mark the group as inactive in the database
             try:
-                await update_group_status(group_id, False) # Added await
+                await update_group_status(group_id, False)
             except Exception as e_status:
-                 # Log error but proceed to remove group data
-                 logger.error(f"Error setting group {group_id} inactive during cleanup: {e_status}")
+                 logger.error(f"Error setting group {group_name} ({group_id}) inactive during cleanup: {e_status}")
 
-            # 3. Remove the group data from the database ONLY if it's not a manual removal
-            if reason != "Manual removal": # Match the default reason from remove_scheduled_job
+            # Remove group data only if cleanup is due to errors (not manual stop)
+            if reason != "Manual removal":
                 try:
-                    await remove_group(group_id) # Added await
+                    await remove_group(group_id)
                 except Exception as e_remove:
-                    # Log error, but cleanup is mostly done
-                    logger.error(f"Error removing group {group_id} data during cleanup: {e_remove}")
+                    logger.error(f"Error removing group {group_name} ({group_id}) data during cleanup: {e_remove}")
             else:
-                logger.info(f"Skipping database removal for group {group_id} due to manual stop.")
+                 logger.info(f"Skipping database removal for group {group_name} ({group_id}) due to manual stop.")
 
-            logger.info(f"Finished cleanup for group {group_id}.")
+            logger.info(f"Finished cleanup for group {group_name} ({group_id}).")
+            return True
         except Exception as e:
-            logger.error(f"Error during cleanup for group {group_id}: {e}")
+            logger.error(f"Error during cleanup for group {group_name} ({group_id}): {e}")
+            return False
 
     async def handle_group_migration(self, bot, old_group_id: str, new_group_id: str):
         """Handle group migration by updating group ID."""
-        # This function needs careful handling of async operations and state
         try:
             logger.info(f"Starting migration: group {old_group_id} → {new_group_id}")
 
-            # 1. Get old group data (asynchronously)
-            group_data = await get_group(old_group_id) # Added await
+            group_data = await get_group(old_group_id)
             if not group_data:
                 logger.warning(f"Group {old_group_id} not found in DB, cannot migrate.")
-                return # Nothing to migrate
+                return
 
-            # 2. Cancel and remove the old task (if running)
+            # Cancel and remove the old task
             if old_group_id in self.tasks:
-                task = self.tasks.pop(old_group_id) # Remove from dict
+                task = self.tasks.pop(old_group_id)
                 if not task.done():
                     task.cancel()
                     try:
@@ -316,42 +372,37 @@ class MessageScheduler:
             else:
                 logger.debug(f"No active task found for old group {old_group_id} during migration.")
 
-            # 3. Remove old group data from DB (asynchronously)
+            # Remove old group data
             try:
-                await remove_group(old_group_id) # Added await
+                await remove_group(old_group_id)
             except Exception as e_remove:
-                 # Log error, but attempt to continue migration
                  logger.error(f"Error removing old group {old_group_id} data during migration: {e_remove}")
 
-            # 4. Add new group data to DB (asynchronously)
+            # Add/Update new group data
             new_group_id_str = str(new_group_id)
             try:
-                await add_group(new_group_id_str, group_data["name"]) # Added await
-                # Update message/status for the *new* group ID
-                # Ensure next_schedule is a datetime object before passing
-                next_schedule_dt = group_data.get("next_schedule") # Should be datetime from get_group
-                await update_group_message(new_group_id_str, group_data.get("last_msg_id"), next_schedule_dt) # Added await
-                await update_group_status(new_group_id_str, group_data.get("active", False)) # Added await
+                await add_group(new_group_id_str, group_data["name"])
+                next_schedule_dt = group_data.get("next_schedule")
+                await update_group_message(new_group_id_str, group_data.get("last_msg_id"), next_schedule_dt)
+                await update_group_status(new_group_id_str, group_data.get("active", False))
+                await update_group_retry_count(new_group_id_str, 0) # Reset retry count for new group
             except Exception as e_add:
                  logger.error(f"Error adding/updating new group {new_group_id_str} during migration: {e_add}")
-                 # If adding the new group fails, the migration is effectively failed.
-                 # Consider if cleanup of the new group ID is needed if partially added.
                  return # Stop migration if new group setup fails
 
-            # 5. Schedule message for the new group ID (if it was active)
+            # Schedule message for the new group ID if it was active
             if group_data.get("active", False):
                 logger.info(f"Scheduling message loop for migrated group {new_group_id_str}")
-                # Fetch potentially updated global settings before scheduling
                 global_settings = await get_global_settings()
                 await self.schedule_message(
                     bot,
                     new_group_id_str,
                     message_reference=global_settings.get("message_reference"),
                     delay=global_settings.get("delay")
+                    # No existing_next_schedule or is_update_restart needed here, treat as new schedule
                 )
             else:
                  logger.info(f"Old group {old_group_id} was inactive, not scheduling loop for new group {new_group_id_str}.")
-
 
             logger.info(f"Group migration {old_group_id} → {new_group_id_str} completed.")
 
@@ -359,7 +410,7 @@ class MessageScheduler:
             logger.error(f"Unexpected error during group migration {old_group_id} → {new_group_id}: {e}", exc_info=True)
             # Attempt cleanup of old group ID if migration failed mid-way
             try:
-                 await self.cleanup_group(old_group_id, f"Migration failure: {e}")
+                 await self.cleanup_group(bot, old_group_id, f"Migration failure: {e}")
             except Exception as e_cleanup:
                  logger.error(f"Error during cleanup after migration failure for {old_group_id}: {e_cleanup}")
 
@@ -367,7 +418,6 @@ class MessageScheduler:
         """Update all running tasks with new settings asynchronously."""
         updated_count = 0
         try:
-            # Fetch global settings asynchronously first
             settings = await get_global_settings()
             effective_message_ref = new_message_reference if new_message_reference is not None else settings.get("message_reference")
             effective_delay = new_delay if new_delay is not None else settings.get("delay")
@@ -382,109 +432,99 @@ class MessageScheduler:
             tasks_to_update = []
             group_ids_to_update = []
 
-            # Iterate through a copy of the tasks dictionary keys
             for group_id in list(self.tasks.keys()):
-                task = self.tasks.get(group_id) # Get task safely
+                task = self.tasks.get(group_id)
                 if task and not task.done():
-                     # Check group status asynchronously *before* deciding to update
                      group_data = await get_group(group_id)
                      if group_data and group_data.get("active", False):
-                         # Schedule the update task (schedule_message handles cancelling old task)
+                         current_next_schedule = group_data.get("next_schedule")
+
                          tasks_to_update.append(
                              self.schedule_message(
                                  bot,
                                  group_id,
                                  message_reference=effective_message_ref,
-                                 delay=effective_delay
+                                 delay=effective_delay,
+                                 existing_next_schedule=current_next_schedule,
+                                 is_update_restart=True # Indicate this is an update
                              )
                          )
-                         group_ids_to_update.append(group_id) # Keep track for logging
+                         group_ids_to_update.append(group_id)
 
-            # Run updates concurrently
             if tasks_to_update:
                  results = await asyncio.gather(*tasks_to_update, return_exceptions=True)
                  for i, result in enumerate(results):
                      group_id = group_ids_to_update[i]
                      if isinstance(result, Exception):
                          logger.error(f"Failed to update task for group {group_id}: {result}")
-                     elif result is True: # Assuming schedule_message returns True on success
+                     elif result is True:
                          updated_count += 1
-                         # logger.info(f"Updated task for group {group_id} with new settings") # schedule_message already logs this
                      else:
                           logger.warning(f"schedule_message returned False for group {group_id} during update.")
-
 
             return updated_count
 
         except aiosqlite.Error as db_err:
              logger.error(f"Database error during update_running_tasks: {db_err}")
-             return updated_count # Return count of successful updates before error
+             return updated_count
         except Exception as e:
             logger.error(f"Failed to update running tasks: {e}", exc_info=True)
-            return updated_count # Return count of successful updates before error
+            return updated_count
 
 
     def is_running(self, group_id: str) -> bool:
+        """Check if a task is currently running for the given group ID."""
         return group_id in self.tasks and not self.tasks[group_id].done()
 
     def get_active_tasks(self) -> int:
+        """Get the count of currently active (not done) tasks."""
         return len([task for task in self.tasks.values() if not task.done()])
 
     async def start(self):
         """Initialize scheduler and recover active tasks asynchronously."""
         try:
-            # Use async context manager and await async functions
-            async with get_db_connection() as conn: # Use async with
-                # No need for explicit cursor if utils handle it
-                settings = await get_global_settings() # Added await
+            async with get_db_connection() as conn:
+                settings = await get_global_settings()
                 current_time = datetime.now(pytz.UTC)
-                # Load data asynchronously
-                all_data = await load_data() # Added await
+                all_data = await load_data()
                 groups_data = all_data.get("groups", {})
 
-                if not settings.get("message_reference"):
+                if not settings.get("message_reference"): # Use .get for safety
                      logger.warning("Scheduler start: Global message reference not set. Cannot recover tasks.")
-                     return # Cannot proceed without a message to send
+                     return
 
-                if settings.get("delay") is None:
+                if settings.get("delay") is None: # Use .get for safety
                      logger.warning("Scheduler start: Global delay not set. Cannot recover tasks.")
-                     return # Cannot proceed without a delay
+                     return
 
                 tasks_to_update_db = []
                 for group_id, group in groups_data.items():
-                    if group.get("active", False):
-                        # next_schedule should be datetime object from load_data
-                        next_schedule_dt = group.get("next_schedule")
-                        # Calculate next time based on potentially recovered datetime
-                        # Pass datetime object directly to calculate_next_schedule if available
-                        next_time = self.calculate_next_schedule(current_time, next_schedule_dt, settings["delay"])
+                    if group.get("active"): # Use .get for safety
+                        next_schedule_dt = group.get("next_schedule") # Already a datetime object or None
+                        # Pass the datetime object directly if available
+                        next_time = self.calculate_next_schedule(current_time, next_schedule_dt.isoformat() if next_schedule_dt else None, settings["delay"])
 
-                        # Prepare DB update task
                         tasks_to_update_db.append(
                             update_group_message(group_id, group.get("last_msg_id"), next_time)
                         )
                         logger.info(f"Recovered schedule for group {group_id} - Next: {next_time.isoformat()}")
                         self.pending_groups[group_id] = {
-                            "message_reference": settings.get("message_reference"),
+                            "message_reference": settings["message_reference"],
                             "delay": settings["delay"],
-                            "next_time": next_time # Store calculated datetime
+                            "next_time": next_time
                         }
 
-                # Run DB updates concurrently
                 if tasks_to_update_db:
                      results = await asyncio.gather(*tasks_to_update_db, return_exceptions=True)
                      failed_updates = [res for res in results if isinstance(res, Exception)]
                      if failed_updates:
                           logger.error(f"Encountered {len(failed_updates)} errors updating group schedules during recovery.")
-                          # Decide how to handle partial failures - maybe log group IDs?
 
-                # Commit happens within update_group_message now
                 logger.info(f"Scheduler initialized - {len(self.pending_groups)} active groups pending task creation.")
         except aiosqlite.Error as db_err:
              logger.error(f"Database error during scheduler start: {db_err}")
-             # Depending on severity, might want to exit or continue without recovery
         except Exception as e:
-            logger.error(f"Scheduler start failed: {e}", exc_info=True) # Log traceback
+            logger.error(f"Scheduler start failed: {e}", exc_info=True)
 
     async def initialize_pending_tasks(self, bot):
         """Initialize tasks for recovered groups with bot instance."""
@@ -494,6 +534,9 @@ class MessageScheduler:
                 current_time = datetime.now(pytz.UTC)
                 wait_time = (next_time - current_time).total_seconds()
 
+                # Always treat recovered tasks as needing to respect the calculated next_time
+                # Use _delayed_message_loop if wait_time > 0, otherwise start _message_loop immediately
+                # but ensure _message_loop knows it's not the absolute first run (is_update_restart=True might work here)
                 if wait_time > 0:
                     self.tasks[group_id] = asyncio.create_task(
                         self._delayed_message_loop(
@@ -504,16 +547,20 @@ class MessageScheduler:
                             initial_delay=wait_time
                         )
                     )
+                    logger.info(f"Created delayed task for recovered group {group_id} - Wait time: {wait_time:.1f}s")
                 else:
+                    # Start immediately but treat it like an update restart so it waits for the *next* cycle
                     self.tasks[group_id] = asyncio.create_task(
                         self._message_loop(
                             bot,
                             group_id,
                             settings["message_reference"],
-                            settings["delay"]
+                            settings["delay"],
+                            is_update_restart=True # Treat immediate recovery like an update restart
                         )
                     )
-                logger.info(f"Created task for recovered group {group_id} - Wait time: {max(0, wait_time):.1f}s")
+                    logger.info(f"Created immediate task for recovered group {group_id} (next cycle will wait).")
+
 
             started_count = len(self.pending_groups)
             self.pending_groups.clear()
@@ -526,39 +573,30 @@ class MessageScheduler:
         """Message loop with initial delay for recovered tasks."""
         try:
             await asyncio.sleep(initial_delay)
-            await self._message_loop(bot, group_id, message_reference, delay)
+            # Start the main loop, indicating it's like an update restart so it waits for the *next* cycle
+            await self._message_loop(bot, group_id, message_reference, delay, is_update_restart=True)
         except Exception as e:
             logger.error(f"Delayed message loop failed for group {group_id}: {e}")
 
-    async def shutdown(self):
+    async def shutdown(self, bot):
+        """Gracefully shutdown the scheduler, cancelling running tasks."""
         try:
             task_count = len(self.tasks)
-            for group_id in list(self.tasks.keys()):
-                await self.remove_scheduled_job(group_id)
+            logger.info(f"Scheduler shutdown initiated. Cancelling {task_count} tasks...")
+            tasks_to_cancel = []
+            for group_id, task in self.tasks.items():
+                 if not task.done():
+                      task.cancel()
+                      tasks_to_cancel.append(task)
+
+            if tasks_to_cancel:
+                 # Wait for cancellations to complete, suppressing CancelledError
+                 await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+                 logger.debug(f"Finished awaiting cancellation for {len(tasks_to_cancel)} tasks.")
+
             self.tasks.clear()
-            logger.info(f"Scheduler stopped - {task_count} tasks cancelled")
+            logger.info(f"Scheduler stopped - {task_count} tasks processed for cancellation.")
         except Exception as e:
             logger.error(f"Scheduler shutdown failed: {e}")
 
-# Global scheduler instance
 scheduler = MessageScheduler()
-
-# Public interface
-async def schedule_message(bot, group_id, message_reference=None, delay=None):
-    return await scheduler.schedule_message(bot, group_id, message_reference, delay)
-
-async def remove_scheduled_job(group_id, reason="Manual removal"):
-    await scheduler.cleanup_group(group_id, reason)
-    return True # Indicate success
-
-async def start_scheduler():
-    await scheduler.start()
-
-async def stop_scheduler():
-    await scheduler.shutdown()
-
-def is_running(group_id: str) -> bool:
-    return scheduler.is_running(group_id)
-
-def get_active_tasks_count() -> int:
-    return scheduler.get_active_tasks()
