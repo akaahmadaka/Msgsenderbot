@@ -11,9 +11,9 @@ from db import get_db_connection
 from utils import (
     get_group,
     remove_group,
-    get_global_settings, update_group_status,
-    update_group_message, add_group,
-    load_data, update_group_retry_count
+    get_global_settings, update_group_status, add_group,
+    load_data, update_group_retry_count, get_global_messages,
+    update_group_after_send
 )
 
 if sys.version_info >= (3, 11):
@@ -52,7 +52,6 @@ class MessageScheduler:
         self,
         bot,
         group_id: str,
-        message_reference: Optional[dict] = None,
         delay: Optional[int] = None,
         existing_next_schedule: Optional[datetime] = None,
         is_update_restart: bool = False
@@ -64,11 +63,6 @@ class MessageScheduler:
                 try:
                     async with get_db_connection() as conn:
                         settings = await get_global_settings()
-
-                        message_ref = message_reference or settings["message_reference"]
-                        if not message_ref:
-                            logger.error(f"No message reference found for group {group_id}")
-                            return False
 
                         delay_val = delay if delay is not None else settings["delay"]
                         if delay_val is None:
@@ -86,10 +80,8 @@ class MessageScheduler:
                             logger.debug(f"Calculating new next schedule for group {group_id} based on current time.")
 
                         group_data = await get_group(group_id)
-                        current_last_msg_id = group_data.get("last_msg_id") if group_data else None
-                        # Update DB with the calculated next_time and potentially existing last_msg_id
-                        await update_group_message(group_id, current_last_msg_id, next_time)
                         await update_group_status(group_id, True)
+                        await update_group_retry_count(group_id, 0)
 
                         if group_id in self.tasks and not self.tasks[group_id].done():
                             self.tasks[group_id].cancel()
@@ -101,7 +93,7 @@ class MessageScheduler:
                                 logger.error(f"Error cancelling existing task for {group_id}: {e_cancel}")
 
                         self.tasks[group_id] = asyncio.create_task(
-                            self._message_loop(bot, group_id, message_ref, delay_val, is_update_restart=is_update_restart)
+                            self._message_loop(bot, group_id, delay_val, is_update_restart=is_update_restart)
                         )
                         logger.info(f"Started/Updated message loop for group {group_id}")
                         return True
@@ -174,10 +166,9 @@ class MessageScheduler:
              raise e
 
 
-    async def _message_loop(self, bot, group_id: str, message_reference: dict, delay: int, is_update_restart: bool = False):
+    async def _message_loop(self, bot, group_id: str, delay: int, is_update_restart: bool = False):
         """Message loop handling retries, fatal errors, and cleanup."""
         MAX_MESSAGE_RETRIES = 3
-        # is_initial_run is True only if it's the very first run after schedule_message (not an update restart)
         is_initial_run = not is_update_restart
 
         while True:
@@ -204,9 +195,7 @@ class MessageScheduler:
 
                 if not run_immediately:
                     current_time = datetime.now(pytz.UTC)
-                    # Ensure next_schedule_dt is fetched correctly (should be datetime object from DB utils)
                     next_schedule_dt = group_data.get("next_schedule")
-                    # Pass the datetime object directly if available
                     next_time = self.calculate_next_schedule(current_time, next_schedule_dt.isoformat() if next_schedule_dt else None, delay)
                     wait_time = (next_time - current_time).total_seconds()
 
@@ -216,27 +205,39 @@ class MessageScheduler:
                 # After the first iteration (whether it waited or ran immediately), subsequent runs should always wait.
                 is_initial_run = False
 
+                # --- Fetch Messages & Select ---
+                global_messages = await get_global_messages()
+                if not global_messages:
+                    logger.warning(f"No global messages set. Pausing loop for group {group_name} ({group_id}). Will check again in {delay}s.")
+                    await asyncio.sleep(delay)
+                    continue
+
+                current_message_index = group_data.get("current_message_index", 0)
+                num_messages = len(global_messages)
+                index_to_use = current_message_index % num_messages
+                message_reference_to_send = global_messages[index_to_use]
+
                 # --- Send/Delete Logic ---
                 try:
                     async with timeout(45):
                         sent_message = await self._send_and_delete_message(
-                            bot, group_id, group_name, message_reference, group_data
+                            bot, group_id, group_name, message_reference_to_send, group_data
                         )
 
                         if sent_message is None:
-                            logger.warning(f"Exiting loop for group {group_name} ({group_id}) due to fatal error.")
+                            logger.warning(f"Exiting loop for group {group_name} ({group_id}) due to fatal error during send/delete.")
                             return
 
                         # --- Success Case ---
-                        logger.info(f"Message sent successfully to {group_name} ({group_id}).")
+                        logger.info(f"Message (Index {index_to_use}) sent successfully to {group_name} ({group_id}). Msg ID: {sent_message.message_id}")
+
                         if current_retry_count > 0:
                             await update_group_retry_count(group_id, 0)
                             logger.info(f"Reset retry count for group {group_name} ({group_id}).")
 
+                        next_message_index = (current_message_index + 1) % num_messages
                         next_time_update = datetime.now(pytz.UTC) + timedelta(seconds=delay)
-                        logger.debug(f"Attempting to update DB for group {group_id} with last_msg_id={sent_message.message_id}")
-                        await update_group_message(group_id, sent_message.message_id, next_time_update)
-                        logger.debug(f"Finished DB update for group {group_id} with last_msg_id={sent_message.message_id}")
+                        await update_group_after_send(group_id, sent_message.message_id, next_message_index, next_time_update)
 
                 # --- Retryable Error Handling ---
                 except (asyncio.TimeoutError, NetworkError, RetryAfter, Forbidden, BadRequest) as e:
@@ -259,7 +260,7 @@ class MessageScheduler:
                         return
                     else:
                         logger.info(f"Will retry for group {group_name} ({group_id}) on next schedule.")
-                        pass # Continue loop to wait for the next calculated schedule time
+                        pass
 
                 except aiosqlite.Error as db_err:
                      logger.error(f"Database error during message loop for group {group_name} ({group_id}): {db_err}")
@@ -284,7 +285,7 @@ class MessageScheduler:
                         return
                     else:
                         logger.info(f"Will retry for group {group_name} ({group_id}) on next schedule after unexpected error.")
-                        pass # Continue loop
+                        pass
 
             # --- Outer Loop Error Handling ---
             except Exception as outer_e:
@@ -313,7 +314,6 @@ class MessageScheduler:
                 except Exception as leave_e:
                     logger.error(f"Failed to leave group {group_name} ({group_id}): {leave_e}")
 
-            # Cancel and remove the asyncio task
             if group_id in self.tasks:
                 task = self.tasks.pop(group_id)
                 if not task.done():
@@ -327,7 +327,6 @@ class MessageScheduler:
             else:
                  logger.debug(f"No active task found for group {group_name} ({group_id}) during cleanup.")
 
-            # Mark the group as inactive in the database
             try:
                 await update_group_status(group_id, False)
             except Exception as e_status:
@@ -358,7 +357,6 @@ class MessageScheduler:
                 logger.warning(f"Group {old_group_id} not found in DB, cannot migrate.")
                 return
 
-            # Cancel and remove the old task
             if old_group_id in self.tasks:
                 task = self.tasks.pop(old_group_id)
                 if not task.done():
@@ -372,34 +370,29 @@ class MessageScheduler:
             else:
                 logger.debug(f"No active task found for old group {old_group_id} during migration.")
 
-            # Remove old group data
             try:
                 await remove_group(old_group_id)
             except Exception as e_remove:
                  logger.error(f"Error removing old group {old_group_id} data during migration: {e_remove}")
 
-            # Add/Update new group data
             new_group_id_str = str(new_group_id)
             try:
                 await add_group(new_group_id_str, group_data["name"])
                 next_schedule_dt = group_data.get("next_schedule")
                 await update_group_message(new_group_id_str, group_data.get("last_msg_id"), next_schedule_dt)
                 await update_group_status(new_group_id_str, group_data.get("active", False))
-                await update_group_retry_count(new_group_id_str, 0) # Reset retry count for new group
+                await update_group_retry_count(new_group_id_str, 0)
             except Exception as e_add:
                  logger.error(f"Error adding/updating new group {new_group_id_str} during migration: {e_add}")
-                 return # Stop migration if new group setup fails
+                 return
 
-            # Schedule message for the new group ID if it was active
             if group_data.get("active", False):
                 logger.info(f"Scheduling message loop for migrated group {new_group_id_str}")
                 global_settings = await get_global_settings()
                 await self.schedule_message(
                     bot,
                     new_group_id_str,
-                    message_reference=global_settings.get("message_reference"),
                     delay=global_settings.get("delay")
-                    # No existing_next_schedule or is_update_restart needed here, treat as new schedule
                 )
             else:
                  logger.info(f"Old group {old_group_id} was inactive, not scheduling loop for new group {new_group_id_str}.")
@@ -414,19 +407,15 @@ class MessageScheduler:
             except Exception as e_cleanup:
                  logger.error(f"Error during cleanup after migration failure for {old_group_id}: {e_cleanup}")
 
-    async def update_running_tasks(self, bot, new_message_reference: Optional[dict] = None, new_delay: Optional[int] = None):
+    async def update_running_tasks(self, bot, new_delay: Optional[int] = None):
         """Update all running tasks with new settings asynchronously."""
         updated_count = 0
         try:
             settings = await get_global_settings()
-            effective_message_ref = new_message_reference if new_message_reference is not None else settings.get("message_reference")
             effective_delay = new_delay if new_delay is not None else settings.get("delay")
 
-            if not effective_message_ref:
-                 logger.error("Cannot update running tasks: No message reference available.")
-                 return 0
             if effective_delay is None:
-                 logger.error("Cannot update running tasks: No delay available.")
+                 logger.error("Cannot update running tasks: No delay available (neither new nor existing).")
                  return 0
 
             tasks_to_update = []
@@ -443,10 +432,9 @@ class MessageScheduler:
                              self.schedule_message(
                                  bot,
                                  group_id,
-                                 message_reference=effective_message_ref,
                                  delay=effective_delay,
                                  existing_next_schedule=current_next_schedule,
-                                 is_update_restart=True # Indicate this is an update
+                                 is_update_restart=True
                              )
                          )
                          group_ids_to_update.append(group_id)
@@ -489,27 +477,26 @@ class MessageScheduler:
                 all_data = await load_data()
                 groups_data = all_data.get("groups", {})
 
-                if not settings.get("message_reference"): # Use .get for safety
-                     logger.warning("Scheduler start: Global message reference not set. Cannot recover tasks.")
-                     return
 
-                if settings.get("delay") is None: # Use .get for safety
+                if settings.get("delay") is None:
                      logger.warning("Scheduler start: Global delay not set. Cannot recover tasks.")
                      return
 
                 tasks_to_update_db = []
                 for group_id, group in groups_data.items():
-                    if group.get("active"): # Use .get for safety
-                        next_schedule_dt = group.get("next_schedule") # Already a datetime object or None
-                        # Pass the datetime object directly if available
+                    if group.get("active"):
+                        next_schedule_dt = group.get("next_schedule")
                         next_time = self.calculate_next_schedule(current_time, next_schedule_dt.isoformat() if next_schedule_dt else None, settings["delay"])
 
-                        tasks_to_update_db.append(
-                            update_group_message(group_id, group.get("last_msg_id"), next_time)
-                        )
-                        logger.info(f"Recovered schedule for group {group_id} - Next: {next_time.isoformat()}")
+                        # tasks_to_update_db.append( # Commenting out the append call itself
+                            # This seems incorrect, update_group_message was removed.
+                            # Should likely be update_group_after_send, but that requires more info (next_index).
+                            # Recovery logic might need rethink if we want to preserve exact state.
+                            # For now, let's comment this out as the loop will set the next schedule anyway.
+                            # update_group_status(group_id, True) # Maybe just ensure active?
+                        # )
+                        logger.info(f"Marking group {group_id} for task recovery - Next approx: {next_time.isoformat()}")
                         self.pending_groups[group_id] = {
-                            "message_reference": settings["message_reference"],
                             "delay": settings["delay"],
                             "next_time": next_time
                         }
@@ -542,8 +529,7 @@ class MessageScheduler:
                         self._delayed_message_loop(
                             bot,
                             group_id,
-                            settings["message_reference"],
-                            settings["delay"],
+                            delay=settings["delay"],
                             initial_delay=wait_time
                         )
                     )
@@ -554,9 +540,9 @@ class MessageScheduler:
                         self._message_loop(
                             bot,
                             group_id,
-                            settings["message_reference"],
+                            # settings["message_reference"], # No longer needed
                             settings["delay"],
-                            is_update_restart=True # Treat immediate recovery like an update restart
+                            is_update_restart=True
                         )
                     )
                     logger.info(f"Created immediate task for recovered group {group_id} (next cycle will wait).")
@@ -569,12 +555,13 @@ class MessageScheduler:
             logger.error(f"Failed to initialize pending tasks: {e}")
             return 0
 
-    async def _delayed_message_loop(self, bot, group_id: str, message_reference: dict, delay: int, initial_delay: float):
+    async def _delayed_message_loop(self, bot, group_id: str, delay: int, initial_delay: float): # Removed message_reference
         """Message loop with initial delay for recovered tasks."""
         try:
             await asyncio.sleep(initial_delay)
             # Start the main loop, indicating it's like an update restart so it waits for the *next* cycle
-            await self._message_loop(bot, group_id, message_reference, delay, is_update_restart=True)
+            # await self._message_loop(bot, group_id, message_reference, delay, is_update_restart=True) # Old call
+            await self._message_loop(bot, group_id, delay, is_update_restart=True)
         except Exception as e:
             logger.error(f"Delayed message loop failed for group {group_id}: {e}")
 
@@ -590,7 +577,7 @@ class MessageScheduler:
                       tasks_to_cancel.append(task)
 
             if tasks_to_cancel:
-                 # Wait for cancellations to complete, suppressing CancelledError
+                 # Wait for cancellations to complete
                  await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
                  logger.debug(f"Finished awaiting cancellation for {len(tasks_to_cancel)} tasks.")
 

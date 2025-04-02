@@ -34,7 +34,7 @@ def setup_logger(level=None):
     root_logger.handlers = []
 
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(BotFormatter(include_timestamp=True))
+    console_handler.setFormatter(BotFormatter(include_timestamp=False))
     root_logger.addHandler(console_handler)
 
     root_logger.debug(f"Logger initialized with level {logging.getLevelName(log_level)}")

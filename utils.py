@@ -40,39 +40,27 @@ def with_db_retry(func):
 @with_db_retry
 async def get_global_settings():
     """
-    Retrieve global settings from the database.
+    Retrieve global settings (currently just delay) from the database.
 
     Returns:
-        dict: A dictionary containing global settings.
+        dict: A dictionary containing global settings (e.g., {'delay': 3600}).
+              Returns default delay if not found.
     Raises:
         aiosqlite.Error: If there's an error with database operations after retries.
     """
     try:
         async with get_db_connection() as conn:
             conn.row_factory = aiosqlite.Row
-            query = """
-            SELECT message, delay, message_reference_chat_id, message_reference_message_id
-            FROM GLOBAL_SETTINGS WHERE id = 1
-            """
+            query = "SELECT delay FROM GLOBAL_SETTINGS WHERE id = 1"
             async with conn.execute(query) as cursor:
                 global_settings_row = await cursor.fetchone()
 
-            if not global_settings_row:
-                logger.warning("Global settings not found in database.")
-                return {"message": "Default message", "delay": 3600, "message_reference": None}
+            if not global_settings_row or global_settings_row["delay"] is None:
+                logger.warning("Global delay not found in database, using default.")
+                from config import GLOBAL_DELAY
+                return {"delay": GLOBAL_DELAY}
 
-            global_settings = dict(global_settings_row)
-            chat_id = global_settings.get("message_reference_chat_id")
-            msg_id = global_settings.get("message_reference_message_id")
-
-            if chat_id and msg_id:
-                global_settings["message_reference"] = {"chat_id": chat_id, "message_id": msg_id}
-            else:
-                global_settings["message_reference"] = None
-
-            global_settings.pop("message_reference_chat_id", None)
-            global_settings.pop("message_reference_message_id", None)
-            return global_settings
+            return {"delay": global_settings_row["delay"]}
     except aiosqlite.Error as e:
         logger.error(f"Error loading global settings from database: {e}")
         raise
@@ -92,7 +80,7 @@ async def load_data():
         async with get_db_connection() as conn:
             conn.row_factory = aiosqlite.Row
             query = """
-            SELECT group_id, name, last_msg_id, next_schedule, active, retry_count, created_at, updated_at
+            SELECT group_id, name, last_msg_id, next_schedule, active, retry_count, current_message_index, created_at, updated_at
             FROM GROUPS
             """
             async with conn.execute(query) as cursor:
@@ -114,6 +102,7 @@ async def load_data():
                     "next_schedule": next_schedule_dt,
                     "active": bool(row["active"]),
                     "retry_count": row["retry_count"],
+                    "current_message_index": row["current_message_index"],
                     "created_at": row["created_at"],
                     "updated_at": row["updated_at"]
                 }
@@ -158,30 +147,32 @@ async def add_group(group_id, group_name):
         raise
 
 @with_db_retry
-async def update_group_message(group_id, message_id, next_time):
+async def update_group_after_send(group_id: str, message_id: int, next_message_index: int, next_time: datetime):
     """
-    Update a group's message information and next schedule time.
+    Update a group's state after successfully sending a message.
 
     Args:
-        group_id (str): The unique identifier for the group
-        message_id (int): The ID of the last message sent, or None
-        next_time (datetime): The next scheduled time as a timezone-aware datetime object (UTC)
+        group_id (str): The unique identifier for the group.
+        message_id (int): The ID of the message just sent.
+        next_message_index (int): The index of the *next* message to be sent.
+        next_time (datetime): The next scheduled time (UTC).
     Raises:
         aiosqlite.Error: If there's an error with database operations after retries.
     """
     try:
         async with get_db_connection() as conn:
-            next_schedule_iso = next_time.isoformat() if next_time else None
+            next_schedule_iso = next_time.isoformat()
             query = """
-            UPDATE GROUPS SET last_msg_id = ?, next_schedule = ?, updated_at = CURRENT_TIMESTAMP
+            UPDATE GROUPS
+            SET last_msg_id = ?, next_schedule = ?, current_message_index = ?, updated_at = CURRENT_TIMESTAMP
             WHERE group_id = ?
             """
-            await conn.execute(query, (message_id, next_schedule_iso, group_id))
+            await conn.execute(query, (message_id, next_schedule_iso, next_message_index, group_id))
             await conn.commit()
-            logger.debug(f"Updated message info for group {group_id}, next schedule: {next_schedule_iso}")
+            logger.debug(f"Updated group {group_id} after send: last_msg={message_id}, next_idx={next_message_index}, next_schedule={next_schedule_iso}")
             return True
     except aiosqlite.Error as e:
-        logger.error(f"Error updating message info for group {group_id}: {e}")
+        logger.error(f"Error updating group {group_id} after send: {e}")
         raise
 
 @with_db_retry
@@ -236,24 +227,6 @@ async def update_group_retry_count(group_id: str, count: int):
 
 
 @with_db_retry
-async def update_global_message_reference(chat_id: int, message_id: int):
-    try:
-        async with get_db_connection() as conn:
-            query = """
-            UPDATE GLOBAL_SETTINGS
-            SET message_reference_chat_id = ?, message_reference_message_id = ?
-            WHERE id = 1
-            """
-            await conn.execute(query, (chat_id, message_id))
-            await conn.commit()
-            logger.info(f"Global message reference updated: ChatID={chat_id}, MessageID={message_id}")
-            return True
-    except aiosqlite.Error as e:
-        logger.error(f"Error updating global message reference: {e}")
-        raise
-
-
-@with_db_retry
 async def update_global_delay(delay: int):
     try:
         async with get_db_connection() as conn:
@@ -284,7 +257,7 @@ async def get_group(group_id: str):
         async with get_db_connection() as conn:
             conn.row_factory = aiosqlite.Row
             cursor = await conn.cursor()
-            await cursor.execute("SELECT * FROM GROUPS WHERE group_id = ?", (group_id,))
+            await cursor.execute("SELECT group_id, name, last_msg_id, next_schedule, active, retry_count, current_message_index FROM GROUPS WHERE group_id = ?", (group_id,))
             row = await cursor.fetchone()
             await cursor.close()
 
@@ -301,10 +274,91 @@ async def get_group(group_id: str):
                     "last_msg_id": row["last_msg_id"],
                     "next_schedule": next_schedule_dt,
                     "active": bool(row["active"]),
-                    "retry_count": row["retry_count"]
+                    "retry_count": row["retry_count"],
+                    "current_message_index": row["current_message_index"]
                 }
             else:
                 return None
     except aiosqlite.Error as e:
         logger.error(f"Error getting group data for {group_id}: {e}")
+        raise
+
+
+
+@with_db_retry
+async def get_global_messages():
+    """
+    Retrieve all global messages ordered by their index.
+
+    Returns:
+        list[dict]: A list of message reference dictionaries
+                    (e.g., [{'chat_id': 123, 'message_id': 456, 'order_index': 0}, ...])
+                    Returns an empty list if no messages are set.
+    Raises:
+        aiosqlite.Error: If there's an error with database operations after retries.
+    """
+    messages = []
+    try:
+        async with get_db_connection() as conn:
+            conn.row_factory = aiosqlite.Row
+            query = """
+            SELECT message_reference_chat_id, message_reference_message_id, order_index
+            FROM GLOBAL_MESSAGES
+            ORDER BY order_index ASC
+            """
+            async with conn.execute(query) as cursor:
+                rows = await cursor.fetchall()
+            for row in rows:
+                messages.append({
+                    "chat_id": row["message_reference_chat_id"],
+                    "message_id": row["message_reference_message_id"],
+                    "order_index": row["order_index"]
+                })
+        return messages
+    except aiosqlite.Error as e:
+        logger.error(f"Error getting global messages: {e}")
+        raise
+
+@with_db_retry
+async def clear_global_messages():
+    """
+    Delete all messages from the GLOBAL_MESSAGES table.
+
+    Raises:
+        aiosqlite.Error: If there's an error with database operations after retries.
+    """
+    try:
+        async with get_db_connection() as conn:
+            await conn.execute("DELETE FROM GLOBAL_MESSAGES")
+            await conn.commit()
+            logger.info("Cleared all global messages.")
+            return True
+    except aiosqlite.Error as e:
+        logger.error(f"Error clearing global messages: {e}")
+        raise
+
+@with_db_retry
+async def add_global_message(chat_id: int, message_id: int, index: int):
+    """
+    Add a single message reference to the GLOBAL_MESSAGES table.
+
+    Args:
+        chat_id (int): The chat ID where the original message exists.
+        message_id (int): The message ID of the original message.
+        index (int): The order index for this message.
+    Raises:
+        aiosqlite.Error: If there's an error with database operations after retries.
+    """
+    try:
+        async with get_db_connection() as conn:
+            query = """
+            INSERT INTO GLOBAL_MESSAGES (message_reference_chat_id, message_reference_message_id, order_index)
+            VALUES (?, ?, ?)
+            """
+            await conn.execute(query, (chat_id, message_id, index))
+            await conn.commit()
+            logger.debug(f"Added global message: ChatID={chat_id}, MessageID={message_id}, Index={index}")
+            return True
+    except aiosqlite.Error as e:
+        logger.error(f"Error adding global message (Index {index}): {e}")
         raise

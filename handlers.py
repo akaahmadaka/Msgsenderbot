@@ -1,9 +1,12 @@
-from telegram import Update
-from telegram.ext import ContextTypes, CommandHandler, ConversationHandler, filters
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import (
+    ContextTypes, CommandHandler, ConversationHandler, filters,
+    CallbackQueryHandler, MessageHandler
+)
 from utils import (
-    load_data, add_group,
-    update_group_status, remove_group,
-    get_global_settings
+    load_data, add_group, update_group_status, remove_group,
+    get_global_settings, clear_global_messages, add_global_message,
+    get_global_messages
 )
 from scheduler import scheduler
 import logging
@@ -19,7 +22,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-WAITING_FOR_MESSAGE = 1
+# Conversation states for /setmsg
+ADDING_MESSAGES, CONFIRM_MESSAGES = range(2)
 
 def is_admin(user_id: int) -> bool:
     """Check if user is an admin."""
@@ -60,6 +64,11 @@ async def toggle_loop(update: Update, context: ContextTypes.DEFAULT_TYPE, start:
             group_name = update.message.chat.title
 
             settings = None
+            global_messages = await get_global_messages()
+            if not global_messages:
+                await update.message.reply_text("❌ Cannot start loop: No global messages are set. Use /setmsg first.")
+                return
+
             async with get_db_connection() as conn:
                 await add_group(group_id, group_name)
                 settings = await get_global_settings()
@@ -69,12 +78,11 @@ async def toggle_loop(update: Update, context: ContextTypes.DEFAULT_TYPE, start:
                  await update.message.reply_text("❌ Failed to retrieve settings to start loop")
                  return
 
-            success = await scheduler.schedule_message(context.bot, group_id, settings.get("message_reference"), settings.get("delay", GLOBAL_DELAY))
+            success = await scheduler.schedule_message(context.bot, group_id, delay=settings.get("delay", GLOBAL_DELAY))
             if not success:
                 await update.message.reply_text("❌ Failed to start message loop")
                 return
 
-            await update.message.reply_text("✅ Message loop started")
         else:
             logger.info(f"Group {group_id} status updated to inactive")
 
@@ -84,67 +92,159 @@ async def toggle_loop(update: Update, context: ContextTypes.DEFAULT_TYPE, start:
                 return
 
             logger.info(f"Message loop stopped for group {group_id}")
-            await update.message.reply_text("✅ Message loop stopped")
 
     except Exception as e:
         logger.error(f"Error in toggle_loop: {e}")
         await update.message.reply_text(f"❌ Failed to {'start' if start else 'stop'} message loop")
 
-async def setmsg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start the setmsg conversation (Admin only)."""
-    try:
-        if not is_admin(update.effective_user.id):
-            await update.message.reply_text("❌ Admin only command!")
-            return ConversationHandler.END
 
-        if update.message.chat.type != "private":
-            await update.message.reply_text("❌ This command only works in private chat!")
-            return ConversationHandler.END
-
-        await update.message.reply_text("📝 Please send the new message you want to set:")
-        return WAITING_FOR_MESSAGE
-
-    except Exception as e:
-        logger.error(f"Error in setmsg: {e}")
-        await update.message.reply_text("❌ Failed to update message")
+async def setmsg_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the /setmsg conversation (Admin only)."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ Admin only command!")
         return ConversationHandler.END
 
-async def receive_new_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle the received message for setmsg."""
+    if update.message.chat.type != "private":
+        await update.message.reply_text("❌ This command only works in private chat!")
+        return ConversationHandler.END
+
     try:
-        from db import get_db_connection
-
-        if not is_admin(update.effective_user.id):
-            return ConversationHandler.END
-
-        message_reference = {
-            "chat_id": update.effective_message.chat_id,
-            "message_id": update.effective_message.message_id
-        }
-
-        async with get_db_connection() as conn:
-            await conn.execute("UPDATE GLOBAL_SETTINGS SET message_reference_chat_id = ?, message_reference_message_id = ? WHERE id = 1",
-                        (message_reference["chat_id"], message_reference["message_id"]))
-            await conn.commit()
-
-        from scheduler import scheduler
-        updated_count = await scheduler.update_running_tasks(
-            context.bot,
-            new_message_reference=message_reference
+        await clear_global_messages()
+        context.user_data['pending_messages'] = []
+        logger.info(f"Admin {user_id} started /setmsg. Cleared previous messages.")
+        await update.message.reply_text(
+            "🗑️ Previous global messages cleared.\n"
+            "📝 Please send the *first* message you want the bot to loop."
         )
-
-        await update.message.reply_text(f"✅ Global message updated!\nMessage ID: {message_reference['message_id']}\nUpdated {updated_count} running tasks")
-        return ConversationHandler.END
-
+        return ADDING_MESSAGES
     except Exception as e:
-        logger.error(f"Error updating message: {e}")
-        await update.message.reply_text("❌ Failed to update message")
+        logger.error(f"Error starting setmsg for admin {user_id}: {e}")
+        await update.message.reply_text("❌ An error occurred starting the process.")
         return ConversationHandler.END
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel the conversation."""
-    await update.message.reply_text("❌ Message update cancelled.")
+async def receive_message_for_setmsg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receives a message during the /setmsg flow."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        logger.warning(f"Non-admin {user_id} attempted to send message during setmsg.")
+        return ConversationHandler.END
+
+    if 'pending_messages' not in context.user_data:
+        logger.warning(f"Admin {user_id} sent message but 'pending_messages' not in user_data. Restarting.")
+        await update.message.reply_text("⚠️ Something went wrong, please start again with /setmsg.")
+        return ConversationHandler.END
+
+    message = update.effective_message
+    message_ref = {
+        "chat_id": message.chat_id,
+        "message_id": message.message_id
+    }
+    context.user_data['pending_messages'].append(message_ref)
+    msg_count = len(context.user_data['pending_messages'])
+
+    logger.info(f"Admin {user_id} added message {msg_count} (ID: {message.message_id}) to pending list.")
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Confirm Messages", callback_data="confirm_setmsg"),
+            InlineKeyboardButton("➕ Add More", callback_data="add_more_setmsg"),
+        ]
+    ])
+
+    await update.message.reply_text(
+        f"✅ Message {msg_count} added (ID: {message.message_id}).\n"
+        f"Total messages pending: {msg_count}\n\n"
+        "Do you want to add another message or confirm the current list?",
+        reply_markup=keyboard
+    )
+    return CONFIRM_MESSAGES
+
+async def handle_setmsg_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles button presses during the /setmsg flow."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_admin(user_id):
+        logger.warning(f"Non-admin {user_id} pressed setmsg button.")
+        await query.edit_message_text("❌ Action not allowed.")
+        return ConversationHandler.END
+
+    if 'pending_messages' not in context.user_data:
+        logger.warning(f"Admin {user_id} pressed button but 'pending_messages' not in user_data.")
+        await query.edit_message_text("⚠️ Something went wrong, please start again with /setmsg.")
+        return ConversationHandler.END
+
+    choice = query.data
+
+    if choice == "add_more_setmsg":
+        logger.info(f"Admin {user_id} chose to add more messages.")
+        await query.edit_message_text("📝 Okay, please send the next message.")
+        return ADDING_MESSAGES
+
+    elif choice == "confirm_setmsg":
+        logger.info(f"Admin {user_id} chose to confirm messages.")
+        pending_messages = context.user_data.get('pending_messages', [])
+
+        if not pending_messages:
+            logger.warning(f"Admin {user_id} confirmed with no pending messages.")
+            await query.edit_message_text("⚠️ No messages were added. Please start again with /setmsg.")
+            context.user_data.pop('pending_messages', None)
+            return ConversationHandler.END
+
+        try:
+            save_tasks = []
+            for index, msg_ref in enumerate(pending_messages):
+                save_tasks.append(
+                    add_global_message(msg_ref['chat_id'], msg_ref['message_id'], index)
+                )
+            results = await asyncio.gather(*save_tasks, return_exceptions=True)
+
+            errors = [res for res in results if isinstance(res, Exception)]
+            if errors:
+                logger.error(f"Failed to save some global messages for admin {user_id}: {errors}")
+                await query.edit_message_text(f"❌ Failed to save all messages ({len(errors)} errors). Please try again.")
+                await clear_global_messages()
+            else:
+                num_saved = len(pending_messages)
+                logger.info(f"Admin {user_id} successfully confirmed and saved {num_saved} global messages.")
+                await query.edit_message_text(
+                    f"✅ Global messages updated!\n"
+                    f"Total messages set: {num_saved}\n\n"
+                    "Running tasks will start using the new message sequence on their next cycle."
+                )
+
+            context.user_data.pop('pending_messages', None)
+            return ConversationHandler.END
+
+        except Exception as e:
+            logger.error(f"Error confirming/saving messages for admin {user_id}: {e}")
+            await query.edit_message_text("❌ An error occurred while saving the messages. Please try again.")
+            await clear_global_messages()
+            context.user_data.pop('pending_messages', None)
+            return ConversationHandler.END
+
+async def setmsg_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancels the /setmsg conversation."""
+    user_id = update.effective_user.id
+    logger.info(f"Admin {user_id} cancelled /setmsg.")
+    context.user_data.pop('pending_messages', None)
+    await update.message.reply_text("❌ Message setup cancelled. No changes were made.")
     return ConversationHandler.END
+
+setmsg_conversation = ConversationHandler(
+    entry_points=[CommandHandler("setmsg", setmsg_start)],
+    states={
+        ADDING_MESSAGES: [MessageHandler(filters.FORWARDED | filters.TEXT | filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.VOICE | filters.AUDIO | filters.Document.ALL | filters.Sticker.ALL, receive_message_for_setmsg)],
+        CONFIRM_MESSAGES: [CallbackQueryHandler(handle_setmsg_button)],
+    },
+    fallbacks=[CommandHandler("cancel", setmsg_cancel)],
+    per_user=True,
+    per_chat=False,
+    per_callback_query=True
+)
+
 
 async def setdelay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Set global delay (Admin only)."""
@@ -189,18 +289,21 @@ async def startall(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ This command only works in private chat!")
             return
 
+        global_messages = await get_global_messages()
+        if not global_messages:
+            await update.message.reply_text("❌ Cannot start loops: No global messages are set. Use /setmsg first.")
+            return
+
         data = await load_data()
         settings = data["global_settings"]
         started_count = 0
 
         for group_id, group in data["groups"].items():
-            # Check if inactive and not in an error state (assuming error_state was replaced by retry_count logic)
-            if not group.get("active", False): # Simplified check, assuming retry_count doesn't block restart
+            if not group.get("active", False):
                 success = await scheduler.schedule_message(
                     context.bot,
                     group_id,
-                    message_reference=settings.get("message_reference"),
-                    delay=GLOBAL_DELAY
+                    delay=settings.get("delay", GLOBAL_DELAY)
                 )
                 if success:
                     started_count += 1

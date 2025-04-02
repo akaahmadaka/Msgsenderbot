@@ -6,8 +6,9 @@ import subprocess
 from telegram.ext import Application, CommandHandler, filters, ConversationHandler, MessageHandler
 from handlers import (
     start,
-    toggle_loop, setmsg, setdelay, status,
-    startall, stopall, WAITING_FOR_MESSAGE, receive_new_message, cancel
+    toggle_loop, setdelay, status,
+    startall, stopall,
+    setmsg_conversation
 )
 from scheduler import scheduler
 from config import BOT_TOKEN
@@ -25,16 +26,6 @@ class Bot:
             # Database will be initialized in main()
             self.is_running = False
 
-            conv_handler = ConversationHandler(
-                entry_points=[CommandHandler("setmsg", setmsg)],
-                states={
-                    WAITING_FOR_MESSAGE: [
-                        MessageHandler(filters.TEXT & ~filters.COMMAND, receive_new_message)
-                    ],
-                },
-                fallbacks=[CommandHandler("cancel", cancel)],
-            )
-
             handlers = [
                 ("start", start, filters.ChatType.PRIVATE | (filters.ChatType.GROUPS & filters.Regex(r"startloop"))),
                 ("startloop", lambda update, context: toggle_loop(update, context, True), None),
@@ -45,7 +36,7 @@ class Bot:
                 ("stopall", stopall, filters.ChatType.PRIVATE)
             ]
 
-            self.app.add_handler(conv_handler)
+            self.app.add_handler(setmsg_conversation)
 
             for command, callback, filter_type in handlers:
                 handler = CommandHandler(command, callback, filters=filter_type) if filter_type else CommandHandler(command, callback)
@@ -74,7 +65,6 @@ class Bot:
 
             self.is_running = True
 
-            # Initialize recovered tasks with bot instance
             recovered_count = await scheduler.initialize_pending_tasks(self.app.bot)
 
             logger.debug(f'Updater before polling: {self.app.updater}')
@@ -99,7 +89,6 @@ class Bot:
         try:
             self.is_running = False
 
-            # Stop scheduler, passing the bot instance
             await scheduler.shutdown(self.app.bot)
 
             if self.app.updater and self.app.updater.running:
@@ -118,7 +107,6 @@ async def main():
     loop = asyncio.get_running_loop()
 
     try:
-        # Initialize the database (create tables)
         await initialize_database()
 
         bot = Bot()

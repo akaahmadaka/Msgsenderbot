@@ -67,18 +67,29 @@ async def initialize_database():
             async with get_db_connection() as conn:
                 cursor = await conn.cursor()
 
-                # Create GLOBAL_SETTINGS table
+                # Create GLOBAL_SETTINGS table (modified)
                 await cursor.execute("""
                 CREATE TABLE IF NOT EXISTS GLOBAL_SETTINGS (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    message TEXT,
-                    delay INTEGER,
-                    message_reference_chat_id INTEGER,
-                    message_reference_message_id INTEGER
+                    id INTEGER PRIMARY KEY CHECK (id = 1), -- Ensure only one row
+                    delay INTEGER NOT NULL
                 )
                 """)
 
-                # Create GROUPS table with improved schema
+                # Create GLOBAL_MESSAGES table (new)
+                await cursor.execute("""
+                CREATE TABLE IF NOT EXISTS GLOBAL_MESSAGES (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_reference_chat_id INTEGER NOT NULL,
+                    message_reference_message_id INTEGER NOT NULL,
+                    order_index INTEGER NOT NULL UNIQUE
+                )
+                """)
+                # Create index for faster lookups
+                await cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_global_messages_order ON GLOBAL_MESSAGES(order_index);
+                """)
+
+                # Create GROUPS table with improved schema (modified)
                 await cursor.execute("""
                 CREATE TABLE IF NOT EXISTS GROUPS (
                     group_id TEXT PRIMARY KEY NOT NULL,
@@ -87,21 +98,18 @@ async def initialize_database():
                     next_schedule TEXT DEFAULT '',
                     active INTEGER DEFAULT 0,
                     retry_count INTEGER DEFAULT 0, -- Replaced error_count and error_state
+                    current_message_index INTEGER NOT NULL DEFAULT 0, -- Added for message cycling
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
                 """)
 
-                # Add default data to global_settings if it doesn't exist
+                # Add default data to global_settings if it doesn't exist (modified)
                 await cursor.execute("SELECT id FROM GLOBAL_SETTINGS WHERE id = 1")
                 if await cursor.fetchone() is None:
                     await cursor.execute("""
-                    INSERT INTO GLOBAL_SETTINGS (
-                        id, message, delay,
-                        message_reference_chat_id, message_reference_message_id
-                    ) VALUES (
-                        1, 'Please set a message using /setmsg', ?, 0, 0
-                    )""", (GLOBAL_DELAY,))
+                    INSERT INTO GLOBAL_SETTINGS (id, delay) VALUES (1, ?)
+                    """, (GLOBAL_DELAY,))
 
                 await conn.commit()
                 await cursor.close()
