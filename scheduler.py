@@ -44,7 +44,7 @@ class MessageScheduler:
                 next_schedule = pytz.utc.localize(next_schedule)
             # Return the future schedule time or calculate based on delay if it's in the past
             return next_schedule if next_schedule > current_time else current_time + timedelta(seconds=delay)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, AttributeError): # Added AttributeError
             # Default to delay from current time if parsing fails or input is invalid
             return current_time + timedelta(seconds=delay)
 
@@ -379,7 +379,13 @@ class MessageScheduler:
             try:
                 await add_group(new_group_id_str, group_data["name"])
                 next_schedule_dt = group_data.get("next_schedule")
-                await update_group_message(new_group_id_str, group_data.get("last_msg_id"), next_schedule_dt)
+                # Use update_group_after_send, passing the current index from the old group data
+                await update_group_after_send(
+                    new_group_id_str,
+                    group_data.get("last_msg_id"),
+                    group_data.get("current_message_index", 0), # Use old index, default to 0
+                    next_schedule_dt
+                )
                 await update_group_status(new_group_id_str, group_data.get("active", False))
                 await update_group_retry_count(new_group_id_str, 0)
             except Exception as e_add:
