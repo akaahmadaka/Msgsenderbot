@@ -58,7 +58,7 @@ async def toggle_loop(update: Update, context: ContextTypes.DEFAULT_TYPE, start:
 
         if start:
             if scheduler.is_running(group_id):
-                await update.message.reply_text("❌ Message loop is already running in this group!")
+                # Loop already running, do nothing silently
                 return
 
             group_name = update.message.chat.title
