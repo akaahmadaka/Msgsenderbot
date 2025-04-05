@@ -242,7 +242,7 @@ setmsg_conversation = ConversationHandler(
     fallbacks=[CommandHandler("cancel", setmsg_cancel)],
     per_user=True,
     per_chat=False,
-    per_callback_query=True
+    #per_callback_query=True
 )
 
 
