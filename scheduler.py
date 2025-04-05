@@ -35,17 +35,23 @@ class MessageScheduler:
         logger.info("Scheduler ready")
 
     def calculate_next_schedule(self, current_time: datetime, next_schedule_str: Optional[str], delay: int) -> datetime:
-        """Calculate the appropriate next schedule time."""
+        """Calculate the appropriate next schedule time, handling recovery."""
         try:
-            # Attempt to parse the ISO format string, handling potential 'Z' for UTC
             next_schedule = datetime.fromisoformat(next_schedule_str.replace('Z', '+00:00'))
-            # Ensure the parsed time is timezone-aware (assuming UTC if not specified)
             if next_schedule.tzinfo is None:
                 next_schedule = pytz.utc.localize(next_schedule)
-            # Return the future schedule time or calculate based on delay if it's in the past
-            return next_schedule if next_schedule > current_time else current_time + timedelta(seconds=delay)
-        except (ValueError, TypeError, AttributeError): # Added AttributeError
-            # Default to delay from current time if parsing fails or input is invalid
+
+            if next_schedule > current_time:
+                return next_schedule
+            else:
+                time_diff_seconds = (current_time - next_schedule).total_seconds()
+                intervals_missed = int(time_diff_seconds // delay)
+                actual_next_time = next_schedule + timedelta(seconds=(intervals_missed + 1) * delay)
+                min_next_time = current_time + timedelta(seconds=1)
+                return max(actual_next_time, min_next_time)
+
+        except (ValueError, TypeError, AttributeError):
+            logger.warning(f"Invalid next_schedule_str '{next_schedule_str}', defaulting to current_time + delay.")
             return current_time + timedelta(seconds=delay)
 
     async def schedule_message(
