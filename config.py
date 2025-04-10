@@ -1,5 +1,8 @@
-# TODO: Move BOT_TOKEN to environment variable for deployment (e.g., os.environ.get('BOT_TOKEN'))
-BOT_TOKEN = "" # Keep for local testing if needed, but ensure it's set in Render env
+import os # Import the os module
+
+# Read BOT_TOKEN from environment variable for deployment
+# Fallback to an empty string for local testing if the env var isn't set
+BOT_TOKEN = os.environ.get('BOT_TOKEN', "")
 
 # TODO: Move ADMIN_IDS to environment variable (e.g., os.environ.get('ADMIN_IDS', '').split(','))
 # Ensure the environment variable is a comma-separated list of integers.
