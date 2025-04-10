@@ -3,7 +3,6 @@ import sys
 from datetime import datetime, timedelta
 from typing import Dict, Optional
 import pytz
-import aiosqlite
 from telegram.error import (
     Forbidden, BadRequest, NetworkError, ChatMigrated, RetryAfter
 )
