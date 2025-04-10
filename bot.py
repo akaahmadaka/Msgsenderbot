@@ -3,6 +3,9 @@ import signal
 import sys
 import logging
 import subprocess
+import os # Added for PORT env var
+import threading # Added for running Flask in thread
+from flask import Flask # Added Flask
 from telegram.ext import Application, CommandHandler, filters, ConversationHandler, MessageHandler
 from handlers import (
     start,
@@ -17,6 +20,15 @@ from logger_config import setup_logger
 
 setup_logger()
 logger = logging.getLogger(__name__)
+
+# --- Flask App Setup ---
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def health_check():
+    # Basic health check endpoint for Render
+    return "Msgsenderbot is running."
+# --- End Flask App Setup ---
 
 class Bot:
     def __init__(self):
@@ -101,8 +113,8 @@ class Bot:
             logger.error(f"Stop failed: {e}")
 
 
-async def main():
-    """Main function"""
+async def run_bot_async():
+    """Main asynchronous function to run the Telegram bot."""
     bot = None
     loop = asyncio.get_running_loop()
 
@@ -126,9 +138,29 @@ async def main():
             await bot.stop()
         await close_pool() # Close pool after bot stops
 
+def run_flask():
+    """Runs the Flask app in a separate thread."""
+    port = int(os.environ.get("PORT", 8080)) # Render provides PORT env var
+    logger.info(f"Starting Flask server on port {port}...")
+    # Use '0.0.0.0' to be accessible externally
+    # Turn off reloader and debug for production/Render
+    flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
 if __name__ == "__main__":
+    # Start Flask in a background daemon thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    logger.info("Starting Telegram bot...")
+    # Run the main bot logic
     try:
-        asyncio.run(main())
+        asyncio.run(run_bot_async())
+    except (KeyboardInterrupt, SystemExit):
+         logger.info("Bot shutdown requested.")
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
+        logger.critical(f"Fatal error in bot execution: {e}", exc_info=True)
         sys.exit(1)
+    finally:
+         logger.info("Bot exiting.")
+         # Note: Pool closing is handled within run_bot_async's finally block
+         # Daemon thread for Flask will exit automatically when main thread exits.

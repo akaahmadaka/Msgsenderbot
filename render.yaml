@@ -1,7 +1,7 @@
 # Render deployment configuration for Msgsenderbot
 
 services:
-  - type: worker # Use 'worker' for background tasks like bots
+  - type: web # Changed from 'worker' to 'web' for free tier compatibility
     name: msgsenderbot
     env: python # Specify the Python environment
     buildCommand: "pip install --upgrade pip && pip install -r requirements.txt"
