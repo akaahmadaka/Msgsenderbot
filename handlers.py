@@ -1,20 +1,21 @@
+import asyncpg # Import asyncpg for error handling if needed
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     ContextTypes, CommandHandler, ConversationHandler, filters,
     CallbackQueryHandler, MessageHandler
 )
-from utils import (
+from utils import ( # Updated imports
     load_data, add_group, update_group_status, remove_group,
     get_global_settings, clear_global_messages, add_global_message,
-    get_global_messages
+    get_global_messages, update_global_delay # Added update_global_delay
 )
 from scheduler import scheduler
 import logging
 import asyncio
-from config import (
+from config import ( # Keep config imports for now, but plan to move to env vars
     ADMIN_IDS, DEEP_LINK_TEMPLATE, WELCOME_MSG, GLOBAL_DELAY
 )
-from db import get_db_connection
+# Removed: from db import get_db_connection
 
 logging.basicConfig(
     level=logging.INFO,
@@ -68,10 +69,10 @@ async def toggle_loop(update: Update, context: ContextTypes.DEFAULT_TYPE, start:
             if not global_messages:
                 await update.message.reply_text("❌ Cannot start loop: No global messages are set. Use /setmsg first.")
                 return
-
-            async with get_db_connection() as conn:
-                await add_group(group_id, group_name)
-                settings = await get_global_settings()
+# Removed redundant 'async with get_db_connection()' block
+# Utils functions now handle their own connections
+await add_group(group_id, group_name)
+settings = await get_global_settings()
 
             if not settings:
                  logger.error(f"Failed to retrieve global settings for group {group_id}")
@@ -266,17 +267,25 @@ async def setdelay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Please provide a valid number!")
             return
 
-        async with get_db_connection() as conn:
-            await conn.execute("UPDATE GLOBAL_SETTINGS SET delay = ? WHERE id = 1", (new_delay,))
-            await conn.commit()
+        # Use the utility function to update the delay
+        success = await update_global_delay(new_delay)
+
+        if not success:
+             # Error logged in util function
+             await update.message.reply_text("❌ Failed to update global delay due to a database error.")
+             return
 
         from scheduler import scheduler
         updated_count = await scheduler.update_running_tasks(context.bot, new_delay=new_delay)
-        await update.message.reply_text(f"✅ Global delay updated!\nNew delay: {new_delay} seconds\nUpdated {updated_count} running tasks")
+        await update.message.reply_text(
+            f"✅ Global delay updated successfully!\n"
+            f"New delay: {new_delay} seconds.\n"
+            f"Attempted to update {updated_count} running group loops with the new delay."
+        )
 
     except Exception as e:
-        logger.error(f"Error in setdelay: {e}")
-        await update.message.reply_text("❌ Failed to update delay")
+        logger.error(f"Error in setdelay command: {e}", exc_info=True)
+        await update.message.reply_text("❌ An unexpected error occurred while setting the delay.")
 
 async def startall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start message loop in all manually stopped groups (Admin only)."""

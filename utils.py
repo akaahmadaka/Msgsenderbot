@@ -1,59 +1,32 @@
-import aiosqlite
+import asyncpg # Replaced aiosqlite
 import asyncio
 import logging
 from datetime import datetime
-import pytz
-from functools import wraps
-from db import get_db_connection
+import pytz # Keep for potential timezone handling if needed, though asyncpg might handle TIMESTAMPTZ well
+# Removed functools wraps
+from db import get_db_connection # Keep this
 from logger_config import setup_logger
 
 setup_logger()
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES = 3
-RETRY_BASE_DELAY = 0.1
+# Removed MAX_RETRIES, RETRY_BASE_DELAY, and with_db_retry decorator
 
-def with_db_retry(func):
-    """Decorator to handle 'database is locked' errors with retries."""
-    @wraps(func)
-    async def wrapper(*args, **kwargs):
-        for attempt in range(MAX_RETRIES):
-            try:
-                return await func(*args, **kwargs)
-            except aiosqlite.OperationalError as e:
-                if "database is locked" in str(e) and attempt < MAX_RETRIES - 1:
-                    wait_time = RETRY_BASE_DELAY * (attempt + 1)
-                    logger.warning(f"Database locked during {func.__name__}, retrying in {wait_time}s... (Attempt {attempt + 1})")
-                    await asyncio.sleep(wait_time)
-                else:
-                    logger.error(f"Database operational error in {func.__name__} after {attempt + 1} attempts: {e}")
-                    raise
-            except aiosqlite.Error as e:
-                logger.error(f"Database error in {func.__name__}: {e}")
-                raise
-            except Exception as e:
-                logger.error(f"Unexpected error in {func.__name__}: {e}", exc_info=True)
-                raise
-        raise aiosqlite.OperationalError(f"Failed {func.__name__} after maximum retries due to database locking.")
-    return wrapper
-
-@with_db_retry
 async def get_global_settings():
     """
     Retrieve global settings (currently just delay) from the database.
 
     Returns:
         dict: A dictionary containing global settings (e.g., {'delay': 3600}).
-              Returns default delay if not found.
+              Returns default delay if not found or on error.
     Raises:
-        aiosqlite.Error: If there's an error with database operations after retries.
+        asyncpg.PostgresError: If there's an unrecoverable error with database operations.
     """
     try:
         async with get_db_connection() as conn:
-            conn.row_factory = aiosqlite.Row
+            # Use fetchrow for a single expected row
             query = "SELECT delay FROM GLOBAL_SETTINGS WHERE id = 1"
-            async with conn.execute(query) as cursor:
-                global_settings_row = await cursor.fetchone()
+            global_settings_row = await conn.fetchrow(query)
 
             if not global_settings_row or global_settings_row["delay"] is None:
                 logger.warning("Global delay not found in database, using default.")
@@ -61,11 +34,19 @@ async def get_global_settings():
                 return {"delay": GLOBAL_DELAY}
 
             return {"delay": global_settings_row["delay"]}
-    except aiosqlite.Error as e:
+    except asyncpg.PostgresError as e:
         logger.error(f"Error loading global settings from database: {e}")
-        raise
+        # Decide on fallback behavior: raise or return default? Returning default might be safer.
+        logger.warning("Returning default global delay due to database error.")
+        from config import GLOBAL_DELAY
+        return {"delay": GLOBAL_DELAY}
+    except Exception as e:
+        logger.error(f"Unexpected error loading global settings: {e}", exc_info=True)
+        logger.warning("Returning default global delay due to unexpected error.")
+        from config import GLOBAL_DELAY
+        return {"delay": GLOBAL_DELAY}
 
-@with_db_retry
+
 async def load_data():
     """
     Load all data from the database including groups and global settings.
@@ -73,80 +54,80 @@ async def load_data():
     Returns:
         dict: A dictionary containing global_settings and groups.
     Raises:
-        aiosqlite.Error: If there's an error with database operations after retries.
+        asyncpg.PostgresError: If there's an error with database operations.
     """
     try:
         groups = {}
         async with get_db_connection() as conn:
-            conn.row_factory = aiosqlite.Row
+            # Use fetch for multiple rows
             query = """
             SELECT group_id, name, last_msg_id, next_schedule, active, retry_count, current_message_index, created_at, updated_at
             FROM GROUPS
             """
-            async with conn.execute(query) as cursor:
-                groups_rows = await cursor.fetchall()
+            groups_rows = await conn.fetch(query)
 
             for row in groups_rows:
-                next_schedule_dt = None
-                if row["next_schedule"]:
-                    try:
-                        next_schedule_dt = datetime.fromisoformat(
-                            row["next_schedule"].replace('Z', '+00:00')
-                        ).replace(tzinfo=pytz.UTC)
-                    except (ValueError, TypeError):
-                        logger.warning(f"Could not parse next_schedule '{row['next_schedule']}' for group {row['group_id']}")
+                # asyncpg returns datetime objects for TIMESTAMPTZ, usually timezone-aware
+                next_schedule_dt = row["next_schedule"] # Directly use the datetime object
+                created_at_dt = row["created_at"]
+                updated_at_dt = row["updated_at"]
 
                 groups[row["group_id"]] = {
                     "name": row["name"],
                     "last_msg_id": row["last_msg_id"],
-                    "next_schedule": next_schedule_dt,
-                    "active": bool(row["active"]),
+                    "next_schedule": next_schedule_dt, # Already datetime
+                    "active": bool(row["active"]), # Ensure boolean
                     "retry_count": row["retry_count"],
                     "current_message_index": row["current_message_index"],
-                    "created_at": row["created_at"],
-                    "updated_at": row["updated_at"]
+                    "created_at": created_at_dt, # Already datetime
+                    "updated_at": updated_at_dt  # Already datetime
                 }
 
         global_settings = await get_global_settings()
         return {"global_settings": global_settings, "groups": groups}
-    except aiosqlite.Error as e:
+    except asyncpg.PostgresError as e:
         logger.error(f"Error loading data from database: {e}")
         raise
+    except Exception as e:
+        logger.error(f"Unexpected error loading data: {e}", exc_info=True)
+        raise
 
-@with_db_retry
-async def add_group(group_id, group_name):
+
+async def add_group(group_id: str, group_name: str):
     """
-    Add a new group to the database or update an existing one.
+    Add a new group to the database or update its name if it exists.
+    Uses PostgreSQL's ON CONFLICT clause for UPSERT behavior.
 
     Args:
-        group_id (str): The unique identifier for the group
-        group_name (str): The name of the group
+        group_id (str): The unique identifier for the group.
+        group_name (str): The name of the group.
     Raises:
-        aiosqlite.Error: If there's an error with database operations after retries.
+        asyncpg.PostgresError: If there's an error with database operations.
     """
     try:
         async with get_db_connection() as conn:
+            # Use INSERT ... ON CONFLICT for UPSERT
             query = """
-            INSERT OR REPLACE INTO GROUPS
-            (group_id, name, last_msg_id, next_schedule, active, retry_count, created_at, updated_at)
-            VALUES (?, ?,
-                COALESCE((SELECT last_msg_id FROM GROUPS WHERE group_id = ?), NULL),
-                COALESCE((SELECT next_schedule FROM GROUPS WHERE group_id = ?), NULL),
-                COALESCE((SELECT active FROM GROUPS WHERE group_id = ?), 0),
-                COALESCE((SELECT retry_count FROM GROUPS WHERE group_id = ?), 0),
-                COALESCE((SELECT created_at FROM GROUPS WHERE group_id = ?), CURRENT_TIMESTAMP),
-                CURRENT_TIMESTAMP
-            )
+            INSERT INTO GROUPS (group_id, name, created_at, updated_at)
+            VALUES ($1, $2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT (group_id) DO UPDATE SET
+                name = EXCLUDED.name,
+                updated_at = CURRENT_TIMESTAMP
             """
-            await conn.execute(query, (group_id, group_name, group_id, group_id, group_id, group_id, group_id))
-            await conn.commit()
+            # Use execute for commands that don't return rows
+            await conn.execute(query, group_id, group_name)
             logger.debug(f"Group {group_id} ({group_name}) added or updated in database")
+            # No explicit commit needed with asyncpg execute usually,
+            # unless inside an explicit transaction block for multiple operations.
             return
-    except aiosqlite.Error as e:
-        logger.error(f"Error adding group {group_id}: {e}")
+    except asyncpg.PostgresError as e:
+        logger.error(f"Error adding/updating group {group_id}: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error adding/updating group {group_id}: {e}", exc_info=True)
         raise
 
-@with_db_retry
+
 async def update_group_after_send(group_id: str, message_id: int, next_message_index: int, next_time: datetime):
     """
     Update a group's state after successfully sending a message.
@@ -155,137 +136,152 @@ async def update_group_after_send(group_id: str, message_id: int, next_message_i
         group_id (str): The unique identifier for the group.
         message_id (int): The ID of the message just sent.
         next_message_index (int): The index of the *next* message to be sent.
-        next_time (datetime): The next scheduled time (UTC).
+        next_time (datetime): The next scheduled time (should be timezone-aware).
     Raises:
-        aiosqlite.Error: If there's an error with database operations after retries.
+        asyncpg.PostgresError: If there's an error with database operations.
     """
     try:
         async with get_db_connection() as conn:
-            next_schedule_iso = next_time.isoformat()
+            # Ensure next_time is timezone-aware if it isn't already
+            if next_time and next_time.tzinfo is None:
+                 logger.warning(f"update_group_after_send received naive datetime for group {group_id}. Assuming UTC.")
+                 next_time = pytz.utc.localize(next_time)
+
             query = """
             UPDATE GROUPS
-            SET last_msg_id = ?, next_schedule = ?, current_message_index = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE group_id = ?
+            SET last_msg_id = $1, next_schedule = $2, current_message_index = $3, updated_at = CURRENT_TIMESTAMP
+            WHERE group_id = $4
             """
-            await conn.execute(query, (message_id, next_schedule_iso, next_message_index, group_id))
-            await conn.commit()
-            logger.debug(f"Updated group {group_id} after send: last_msg={message_id}, next_idx={next_message_index}, next_schedule={next_schedule_iso}")
+            # Pass parameters in order corresponding to $1, $2, ...
+            await conn.execute(query, message_id, next_time, next_message_index, group_id)
+            logger.debug(f"Updated group {group_id} after send: last_msg={message_id}, next_idx={next_message_index}, next_schedule={next_time.isoformat() if next_time else 'None'}")
             return True
-    except aiosqlite.Error as e:
+    except asyncpg.PostgresError as e:
         logger.error(f"Error updating group {group_id} after send: {e}")
         raise
+    except Exception as e:
+        logger.error(f"Unexpected error updating group {group_id} after send: {e}", exc_info=True)
+        raise
 
-@with_db_retry
+
 async def update_group_status(group_id: str, active: bool):
     """
     Update a group's active status.
 
     Args:
-        group_id (str): The unique identifier for the group
-        active (bool): Whether the group is active or not
+        group_id (str): The unique identifier for the group.
+        active (bool): Whether the group is active or not.
     Raises:
-        aiosqlite.Error: If there's an error with database operations after retries.
+        asyncpg.PostgresError: If there's an error with database operations.
     """
     try:
         async with get_db_connection() as conn:
             query = """
-            UPDATE GROUPS SET active = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE group_id = ?
+            UPDATE GROUPS SET active = $1, updated_at = CURRENT_TIMESTAMP
+            WHERE group_id = $2
             """
-            await conn.execute(query, (int(active), group_id))
-            await conn.commit()
+            await conn.execute(query, active, group_id) # Pass boolean directly
             logger.info(f"Updated status for group {group_id} - Active: {active}")
             return True
-    except aiosqlite.Error as e:
+    except asyncpg.PostgresError as e:
         logger.error(f"Error updating status for group {group_id}: {e}")
         raise
+    except Exception as e:
+        logger.error(f"Unexpected error updating status for group {group_id}: {e}", exc_info=True)
+        raise
 
-@with_db_retry
+
 async def update_group_retry_count(group_id: str, count: int):
     """
     Update a group's retry count.
 
     Args:
-        group_id (str): The unique identifier for the group
-        count (int): The new retry count
+        group_id (str): The unique identifier for the group.
+        count (int): The new retry count.
     Raises:
-        aiosqlite.Error: If there's an error with database operations after retries.
+        asyncpg.PostgresError: If there's an error with database operations.
     """
     try:
         async with get_db_connection() as conn:
             query = """
-            UPDATE GROUPS SET retry_count = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE group_id = ?
+            UPDATE GROUPS SET retry_count = $1, updated_at = CURRENT_TIMESTAMP
+            WHERE group_id = $2
             """
-            await conn.execute(query, (count, group_id))
-            await conn.commit()
+            await conn.execute(query, count, group_id)
             logger.debug(f"Updated retry count for group {group_id} to {count}")
             return True
-    except aiosqlite.Error as e:
+    except asyncpg.PostgresError as e:
         logger.error(f"Error updating retry count for group {group_id}: {e}")
         raise
-
-
-@with_db_retry
-async def update_global_delay(delay: int):
-    try:
-        async with get_db_connection() as conn:
-            query = "UPDATE GLOBAL_SETTINGS SET delay = ? WHERE id = 1"
-            await conn.execute(query, (delay,))
-            await conn.commit()
-            logger.info(f"Global delay updated to: {delay} seconds")
-            return True
-    except aiosqlite.Error as e:
-        logger.error(f"Error updating global delay: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error updating retry count for group {group_id}: {e}", exc_info=True)
         raise
 
 
-async def remove_group(group_id):
+async def update_global_delay(delay: int):
+    """Updates the global delay setting."""
+    try:
+        async with get_db_connection() as conn:
+            # Use transaction for safety, though it's a single operation
+            async with conn.transaction():
+                query = "UPDATE GLOBAL_SETTINGS SET delay = $1 WHERE id = 1"
+                await conn.execute(query, delay)
+            logger.info(f"Global delay updated to: {delay} seconds")
+            return True
+    except asyncpg.PostgresError as e:
+        logger.error(f"Error updating global delay: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error updating global delay: {e}", exc_info=True)
+        raise
+
+
+async def remove_group(group_id: str):
     """Remove a group from the database asynchronously."""
     try:
         async with get_db_connection() as conn:
-            await conn.execute("DELETE FROM GROUPS WHERE group_id = ?", (group_id,))
-            await conn.commit()
+            # Use transaction for safety
+            async with conn.transaction():
+                await conn.execute("DELETE FROM GROUPS WHERE group_id = $1", group_id)
             logger.info(f"Removed group {group_id} from database.")
-    except aiosqlite.Error as e:
+    except asyncpg.PostgresError as e:
         logger.error(f"Error removing group {group_id}: {e}")
         raise
+    except Exception as e:
+        logger.error(f"Unexpected error removing group {group_id}: {e}", exc_info=True)
+        raise
+
 
 async def get_group(group_id: str):
     """Get a specific group's data asynchronously."""
     try:
         async with get_db_connection() as conn:
-            conn.row_factory = aiosqlite.Row
-            cursor = await conn.cursor()
-            await cursor.execute("SELECT group_id, name, last_msg_id, next_schedule, active, retry_count, current_message_index FROM GROUPS WHERE group_id = ?", (group_id,))
-            row = await cursor.fetchone()
-            await cursor.close()
+            query = """
+            SELECT group_id, name, last_msg_id, next_schedule, active, retry_count, current_message_index
+            FROM GROUPS WHERE group_id = $1
+            """
+            row = await conn.fetchrow(query, group_id)
 
             if row:
-                next_schedule_dt = None
-                if row["next_schedule"]:
-                    try:
-                        next_schedule_dt = datetime.fromisoformat(row["next_schedule"].replace('Z', '+00:00')).replace(tzinfo=pytz.UTC)
-                    except (ValueError, TypeError):
-                        logger.warning(f"Could not parse next_schedule '{row['next_schedule']}' for group {group_id} in get_group")
-
+                # Directly use values from the Record object
                 return {
                     "name": row["name"],
                     "last_msg_id": row["last_msg_id"],
-                    "next_schedule": next_schedule_dt,
+                    "next_schedule": row["next_schedule"], # Already datetime
                     "active": bool(row["active"]),
                     "retry_count": row["retry_count"],
                     "current_message_index": row["current_message_index"]
                 }
             else:
                 return None
-    except aiosqlite.Error as e:
+    except asyncpg.PostgresError as e:
         logger.error(f"Error getting group data for {group_id}: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error getting group data for {group_id}: {e}", exc_info=True)
         raise
 
 
-
-@with_db_retry
 async def get_global_messages():
     """
     Retrieve all global messages ordered by their index.
@@ -293,21 +289,19 @@ async def get_global_messages():
     Returns:
         list[dict]: A list of message reference dictionaries
                     (e.g., [{'chat_id': 123, 'message_id': 456, 'order_index': 0}, ...])
-                    Returns an empty list if no messages are set.
+                    Returns an empty list if no messages are set or on error.
     Raises:
-        aiosqlite.Error: If there's an error with database operations after retries.
+        asyncpg.PostgresError: If there's an unrecoverable error with database operations.
     """
     messages = []
     try:
         async with get_db_connection() as conn:
-            conn.row_factory = aiosqlite.Row
             query = """
             SELECT message_reference_chat_id, message_reference_message_id, order_index
             FROM GLOBAL_MESSAGES
             ORDER BY order_index ASC
             """
-            async with conn.execute(query) as cursor:
-                rows = await cursor.fetchall()
+            rows = await conn.fetch(query)
             for row in rows:
                 messages.append({
                     "chat_id": row["message_reference_chat_id"],
@@ -315,29 +309,39 @@ async def get_global_messages():
                     "order_index": row["order_index"]
                 })
         return messages
-    except aiosqlite.Error as e:
+    except asyncpg.PostgresError as e:
         logger.error(f"Error getting global messages: {e}")
-        raise
+        # Return empty list on error to prevent crashes in scheduler loop
+        logger.warning("Returning empty global message list due to database error.")
+        return []
+    except Exception as e:
+        logger.error(f"Unexpected error getting global messages: {e}", exc_info=True)
+        logger.warning("Returning empty global message list due to unexpected error.")
+        return []
 
-@with_db_retry
+
 async def clear_global_messages():
     """
     Delete all messages from the GLOBAL_MESSAGES table.
 
     Raises:
-        aiosqlite.Error: If there's an error with database operations after retries.
+        asyncpg.PostgresError: If there's an error with database operations.
     """
     try:
         async with get_db_connection() as conn:
-            await conn.execute("DELETE FROM GLOBAL_MESSAGES")
-            await conn.commit()
+            # Use transaction for safety
+            async with conn.transaction():
+                await conn.execute("DELETE FROM GLOBAL_MESSAGES")
             logger.info("Cleared all global messages.")
             return True
-    except aiosqlite.Error as e:
+    except asyncpg.PostgresError as e:
         logger.error(f"Error clearing global messages: {e}")
         raise
+    except Exception as e:
+        logger.error(f"Unexpected error clearing global messages: {e}", exc_info=True)
+        raise
 
-@with_db_retry
+
 async def add_global_message(chat_id: int, message_id: int, index: int):
     """
     Add a single message reference to the GLOBAL_MESSAGES table.
@@ -347,18 +351,26 @@ async def add_global_message(chat_id: int, message_id: int, index: int):
         message_id (int): The message ID of the original message.
         index (int): The order index for this message.
     Raises:
-        aiosqlite.Error: If there's an error with database operations after retries.
+        asyncpg.PostgresError: If there's an error with database operations.
     """
     try:
         async with get_db_connection() as conn:
-            query = """
-            INSERT INTO GLOBAL_MESSAGES (message_reference_chat_id, message_reference_message_id, order_index)
-            VALUES (?, ?, ?)
-            """
-            await conn.execute(query, (chat_id, message_id, index))
-            await conn.commit()
+            # Use transaction for safety
+            async with conn.transaction():
+                query = """
+                INSERT INTO GLOBAL_MESSAGES (message_reference_chat_id, message_reference_message_id, order_index)
+                VALUES ($1, $2, $3)
+                """
+                await conn.execute(query, chat_id, message_id, index)
             logger.debug(f"Added global message: ChatID={chat_id}, MessageID={message_id}, Index={index}")
             return True
-    except aiosqlite.Error as e:
-        logger.error(f"Error adding global message (Index {index}): {e}")
+    except asyncpg.PostgresError as e:
+        # Catch potential unique constraint violation if index already exists
+        if isinstance(e, asyncpg.UniqueViolationError):
+             logger.error(f"Error adding global message: Index {index} already exists. {e}")
+        else:
+             logger.error(f"Error adding global message (Index {index}): {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error adding global message (Index {index}): {e}", exc_info=True)
         raise

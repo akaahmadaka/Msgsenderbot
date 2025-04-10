@@ -12,7 +12,7 @@ from handlers import (
 )
 from scheduler import scheduler
 from config import BOT_TOKEN
-from db import initialize_database
+from db import initialize_database, create_pool, close_pool # Added pool functions
 from logger_config import setup_logger
 
 setup_logger()
@@ -107,6 +107,7 @@ async def main():
     loop = asyncio.get_running_loop()
 
     try:
+        await create_pool() # Create pool before initializing DB
         await initialize_database()
 
         bot = Bot()
@@ -123,6 +124,7 @@ async def main():
     finally:
         if bot:
             await bot.stop()
+        await close_pool() # Close pool after bot stops
 
 if __name__ == "__main__":
     try:

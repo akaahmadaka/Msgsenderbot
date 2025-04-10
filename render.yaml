@@ -1,0 +1,19 @@
+# Render deployment configuration for Msgsenderbot
+
+services:
+  - type: worker # Use 'worker' for background tasks like bots
+    name: msgsenderbot
+    env: python # Specify the Python environment
+    buildCommand: "pip install --upgrade pip && pip install -r requirements.txt"
+    startCommand: "python bot.py"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11 # Specify a Python version compatible with dependencies (e.g., 3.9, 3.10, 3.11)
+      - key: DATABASE_URL # Connection string for your Aiven PostgreSQL DB
+        sync: false # Mark as secret, value set in Render dashboard
+      - key: BOT_TOKEN
+        sync: false # Mark as secret, value set in Render dashboard
+      - key: ADMIN_IDS # Comma-separated list of integers
+        sync: false # Mark as secret, value set in Render dashboard
+
+# Removed databases block - Database is hosted externally (Aiven.io)
