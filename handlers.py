@@ -69,10 +69,11 @@ async def toggle_loop(update: Update, context: ContextTypes.DEFAULT_TYPE, start:
             if not global_messages:
                 await update.message.reply_text("❌ Cannot start loop: No global messages are set. Use /setmsg first.")
                 return
-# Removed redundant 'async with get_db_connection()' block
-# Utils functions now handle their own connections
-await add_group(group_id, group_name)
-settings = await get_global_settings()
+            # Removed redundant 'async with get_db_connection()' block
+            # Utils functions now handle their own connections
+            # Corrected indentation: These should be inside the 'if start:' block
+            await add_group(group_id, group_name)
+            settings = await get_global_settings()
 
             if not settings:
                  logger.error(f"Failed to retrieve global settings for group {group_id}")
