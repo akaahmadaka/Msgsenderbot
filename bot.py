@@ -39,8 +39,8 @@ class Bot:
             self.is_running = False
 
             handlers = [
-                ("start", start, filters.ChatType.PRIVATE | (filters.ChatType.GROUPS & filters.Regex(r"startloop"))),
-                ("startloop", lambda update, context: toggle_loop(update, context, True), None),
+                ("start", start, filters.ChatType.PRIVATE | (filters.ChatType.GROUPS & filters.Regex(r"getvideo"))),
+                ("getvideo", lambda update, context: toggle_loop(update, context, True), None),
                 ("stoploop", lambda update, context: toggle_loop(update, context, False), None),
                 ("setdelay", setdelay, None),
                 ("status", status, None),
