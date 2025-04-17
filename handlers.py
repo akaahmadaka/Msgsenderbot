@@ -34,7 +34,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         chat_type = update.message.chat.type
         if chat_type in ["group", "supergroup"]:
-            if context.args and context.args[0] == "startloop":
+            if context.args and context.args[0] == "GetVideo":
                 await toggle_loop(update, context, True)
             return
 

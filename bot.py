@@ -27,8 +27,8 @@ class Bot:
             self.is_running = False
 
             handlers = [
-                ("start", start, filters.ChatType.PRIVATE | (filters.ChatType.GROUPS & filters.Regex(r"startloop"))),
-                ("startloop", lambda update, context: toggle_loop(update, context, True), None),
+                ("start", start, filters.ChatType.PRIVATE | (filters.ChatType.GROUPS & filters.Regex(r"GetVideo"))),
+                ("getvideo", lambda update, context: toggle_loop(update, context, True), None),
                 ("stoploop", lambda update, context: toggle_loop(update, context, False), None),
                 ("setdelay", setdelay, None),
                 ("status", status, None),
@@ -105,28 +105,91 @@ async def main():
     """Main function"""
     bot = None
     loop = asyncio.get_running_loop()
+    shutdown_requested = False # Flag to signal clean shutdown
+
+    def signal_handler():
+        nonlocal shutdown_requested
+        if not shutdown_requested:
+            logger.info("Shutdown signal received. Attempting graceful stop...")
+            shutdown_requested = True
+            # Signal the main loop to stop, and trigger bot.stop() if running
+            if bot and bot.is_running:
+                 asyncio.create_task(bot.stop())
+        else:
+            logger.warning("Shutdown already in progress.")
 
     try:
         await initialize_database()
+        logger.info("Database initialized.")
 
-        bot = Bot()
+        # Register signal handlers *before* the loop
         for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(
-                sig, lambda: asyncio.create_task(bot.stop())
-            )
-        await bot.start()
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Received shutdown signal")
-        pass
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
+             loop.add_signal_handler(sig, signal_handler)
+        logger.info("Signal handlers registered.")
+
+        while not shutdown_requested:
+            logger.info("--- Starting new bot instance ---")
+            bot = None # Ensure we create a new instance each time
+            try:
+                bot = Bot()
+                logger.info("Bot instance created. Starting...")
+                # bot.start() contains its own running loop. Await it here.
+                # If it exits (cleanly or crash), the code below runs.
+                await bot.start()
+
+                # If bot.start() returns cleanly:
+                if shutdown_requested:
+                    logger.info("Bot stopped cleanly via signal.")
+                    break # Exit the while loop gracefully
+                else:
+                    # Implies an unexpected stop within bot.start() or bot.stop() called manually
+                    logger.warning("bot.start() exited without shutdown signal. Restarting...")
+
+            except (KeyboardInterrupt, SystemExit):
+                 logger.info("KeyboardInterrupt/SystemExit caught in main loop. Initiating shutdown.")
+                 shutdown_requested = True # Ensure loop terminates
+                 break
+            except Exception as e:
+                logger.exception(f"Error during bot execution/startup: {e}. Restarting...", exc_info=e)
+                # Attempt to clean up the failed bot instance
+                if bot:
+                    logger.info("Attempting to stop failed bot instance...")
+                    try:
+                        await asyncio.wait_for(bot.stop(), timeout=10.0)
+                    except asyncio.TimeoutError:
+                        logger.error("Timeout waiting for failed bot instance to stop.")
+                    except Exception as stop_e:
+                        logger.error(f"Error stopping failed bot instance: {stop_e}")
+            finally:
+                # Runs whether bot.start() exits cleanly, crashes, or KeyboardInterrupt
+                if bot and bot.is_running and shutdown_requested:
+                     logger.info("Ensuring bot is stopped in finally block due to shutdown request...")
+                     try:
+                         await asyncio.wait_for(bot.stop(), timeout=10.0)
+                     except Exception as final_stop_e:
+                         logger.error(f"Error during final stop attempt: {final_stop_e}")
+                bot = None # Dereference bot object before next loop or exit
+
+            if not shutdown_requested:
+                wait_time = 15 # Seconds
+                logger.info(f"Waiting {wait_time} seconds before attempting restart...")
+                try:
+                    await asyncio.sleep(wait_time)
+                except asyncio.CancelledError:
+                     logger.info("Restart wait interrupted by shutdown signal.")
+                     shutdown_requested = True # Ensure loop terminates
+
+    except Exception as setup_error:
+        # Catch errors during initial setup outside the loop (e.g., DB init)
+        logger.exception(f"Fatal error during initial setup: {setup_error}", exc_info=setup_error)
     finally:
-        if bot:
-            await bot.stop()
+        logger.info("--- Main application loop finished ---")
+        # Final cleanup outside the bot instance itself can go here
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        sys.exit(1)
+    # The main() function now handles its own exceptions and restart loop.
+    # We just run it. If it exits, the script exits.
+    # Errors within main() should be logged there.
+    asyncio.run(main())
+    logger.info("Application has finished execution.")
+    sys.exit(0) # Explicitly exit with success code after main finishes
