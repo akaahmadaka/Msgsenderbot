@@ -487,14 +487,44 @@ async def handle_get_videos_click(update: Update, context: ContextTypes.DEFAULT_
         else:
              logger.warning(f"Received unexpected callback data: {callback_data}")
 
-        # Answer the callback query. If we have the URL, attempt to redirect.
-        # If URL generation failed, answer normally to stop the loading indicator.
-        if deep_link_url:
-            # Use the url parameter in answerCallbackQuery to suggest opening the link
-            await query.answer(url=deep_link_url)
-            logger.debug(f"Answered callback for group {group_id} with redirect URL suggestion: {deep_link_url}")
-        else:
-            await query.answer("Processing click...") # Generic answer if redirect fails
+        # 1. Acknowledge the callback immediately to stop the loading indicator
+        await query.answer()
+        logger.debug(f"Acknowledged get_videos_click callback for group {group_id}")
+
+        # 2. Ensure deep_link_url was generated (it should be, based on code above this snippet)
+        if not deep_link_url:
+             logger.error(f"Could not generate deep_link_url for bot username in get_videos_click handler.")
+             return # Don't proceed without the link
+
+        # 3. Define the message text
+        message_text = (
+            "🔞⬇️ FREE VIDEOS BOT ⬇️🔞\n\n"
+            f"{deep_link_url}\n\n"
+            "⬆️⬆️⬆️⬆️⬆️⬆️⬆️⬆️⬆️⬆️⬆️\n\n"
+            "⬆️ click on above link ⬆️ Select chat ⬆️ i will start sending videos 🔞👙👙🥵😐🔞"
+        )
+
+        # 4. Send the new message with the link
+        try:
+            sent_link_message = await query.message.reply_text(
+                text=message_text,
+                disable_web_page_preview=True # Optional: keeps message cleaner
+            )
+            logger.info(f"Sent temporary deep link message to chat {query.message.chat_id} for group {group_id}")
+
+            # 5. Schedule the message for deletion
+            async def delete_message_later(message_to_delete, delay):
+                await asyncio.sleep(delay)
+                try:
+                    await message_to_delete.delete()
+                    logger.info(f"Deleted temporary deep link message {message_to_delete.message_id} from chat {message_to_delete.chat_id}")
+                except Exception as delete_error:
+                    logger.warning(f"Could not delete temporary message {message_to_delete.message_id}: {delete_error}")
+
+            asyncio.create_task(delete_message_later(sent_link_message, 30))
+
+        except Exception as send_error:
+            logger.error(f"Failed to send or schedule deletion for deep link message in chat {query.message.chat_id}: {send_error}")
 
     except Exception as e:
         logger.error(f"Error handling 'Get Videos' button click for user {user_id}: {e}")
