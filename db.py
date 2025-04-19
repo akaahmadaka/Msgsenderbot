@@ -145,6 +145,13 @@ async def initialize_database():
                     )
                     """)
 
+                    # Add click_count column to GROUPS if it doesn't exist
+                    await conn.execute("""
+                    ALTER TABLE GROUPS
+                    ADD COLUMN IF NOT EXISTS click_count INTEGER DEFAULT 0 NOT NULL;
+                    """)
+                    logger.info("Ensured 'click_count' column exists in GROUPS table.")
+
                     # Add default data to global_settings if it doesn't exist
                     settings_exist = await conn.fetchrow("SELECT id FROM GLOBAL_SETTINGS WHERE id = 1")
                     if settings_exist is None:
@@ -175,7 +182,3 @@ async def initialize_database():
     # This part should ideally not be reached if retries fail, as exceptions are raised
     logger.critical(f"Database initialization failed after {max_retries} attempts.")
     raise RuntimeError("Database initialization failed after maximum retries.")
-
-# Note: Need to call create_pool() at application startup
-# and close_pool() at application shutdown.
-# These calls should likely be added in bot.py's main/start/stop logic.

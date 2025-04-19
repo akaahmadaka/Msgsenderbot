@@ -6,12 +6,13 @@ import subprocess
 import os # Added for PORT env var
 import threading # Added for running Flask in thread
 from flask import Flask # Added Flask
-from telegram.ext import Application, CommandHandler, filters, ConversationHandler, MessageHandler
+from telegram.ext import Application, CommandHandler, filters, ConversationHandler, MessageHandler, CallbackQueryHandler # Added CallbackQueryHandler
 from handlers import (
     start,
     toggle_loop, setdelay, status,
     startall, stopall,
-    setmsg_conversation
+    setmsg_conversation,
+    handle_get_videos_click # Added handle_get_videos_click
 )
 from scheduler import scheduler
 from config import BOT_TOKEN
@@ -53,6 +54,9 @@ class Bot:
             for command, callback, filter_type in handlers:
                 handler = CommandHandler(command, callback, filters=filter_type) if filter_type else CommandHandler(command, callback)
                 self.app.add_handler(handler)
+
+            # Add handler for the "Get Videos" button clicks
+            self.app.add_handler(CallbackQueryHandler(handle_get_videos_click, pattern=r"^get_videos_click_"))
 
             self.app.add_error_handler(self.error_handler)
             logger.info("Handlers setup completed successfully")

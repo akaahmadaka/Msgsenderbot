@@ -61,7 +61,7 @@ async def load_data():
         async with get_db_connection() as conn:
             # Use fetch for multiple rows
             query = """
-            SELECT group_id, name, last_msg_id, next_schedule, active, retry_count, current_message_index, created_at, updated_at
+            SELECT group_id, name, last_msg_id, next_schedule, active, retry_count, current_message_index, created_at, updated_at, click_count
             FROM GROUPS
             """
             groups_rows = await conn.fetch(query)
@@ -80,7 +80,8 @@ async def load_data():
                     "retry_count": row["retry_count"],
                     "current_message_index": row["current_message_index"],
                     "created_at": created_at_dt, # Already datetime
-                    "updated_at": updated_at_dt  # Already datetime
+                    "updated_at": updated_at_dt,  # Already datetime
+                    "click_count": row["click_count"] # Added click count
                 }
 
         global_settings = await get_global_settings()
@@ -108,11 +109,11 @@ async def add_group(group_id: str, group_name: str):
         async with get_db_connection() as conn:
             # Use INSERT ... ON CONFLICT for UPSERT
             query = """
-            INSERT INTO GROUPS (group_id, name, created_at, updated_at)
-            VALUES ($1, $2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            INSERT INTO GROUPS (group_id, name, created_at, updated_at, click_count) -- Added click_count to insert
+            VALUES ($1, $2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 0) -- Default click_count to 0 on insert
             ON CONFLICT (group_id) DO UPDATE SET
                 name = EXCLUDED.name,
-                updated_at = CURRENT_TIMESTAMP
+                updated_at = CURRENT_TIMESTAMP -- Don't update click_count on conflict/update
             """
             # Use execute for commands that don't return rows
             await conn.execute(query, group_id, group_name)
@@ -257,7 +258,7 @@ async def get_group(group_id: str):
     try:
         async with get_db_connection() as conn:
             query = """
-            SELECT group_id, name, last_msg_id, next_schedule, active, retry_count, current_message_index
+            SELECT group_id, name, last_msg_id, next_schedule, active, retry_count, current_message_index, click_count
             FROM GROUPS WHERE group_id = $1
             """
             row = await conn.fetchrow(query, group_id)
@@ -270,7 +271,8 @@ async def get_group(group_id: str):
                     "next_schedule": row["next_schedule"], # Already datetime
                     "active": bool(row["active"]),
                     "retry_count": row["retry_count"],
-                    "current_message_index": row["current_message_index"]
+                    "current_message_index": row["current_message_index"],
+                    "click_count": row["click_count"] # Added click count
                 }
             else:
                 return None
@@ -373,4 +375,36 @@ async def add_global_message(chat_id: int, message_id: int, index: int):
         raise
     except Exception as e:
         logger.error(f"Unexpected error adding global message (Index {index}): {e}", exc_info=True)
+        raise
+
+
+async def increment_group_click_count(group_id: str):
+    """
+    Increment the click count for a specific group.
+
+    Args:
+        group_id (str): The unique identifier for the group.
+    Raises:
+        asyncpg.PostgresError: If there's an error with database operations.
+    """
+    try:
+        async with get_db_connection() as conn:
+            query = """
+            UPDATE GROUPS
+            SET click_count = click_count + 1, updated_at = CURRENT_TIMESTAMP
+            WHERE group_id = $1
+            """
+            result = await conn.execute(query, group_id)
+            # Check if any row was updated
+            if result == 'UPDATE 1':
+                logger.debug(f"Incremented click count for group {group_id}")
+                return True
+            else:
+                logger.warning(f"Attempted to increment click count for non-existent group {group_id}")
+                return False
+    except asyncpg.PostgresError as e:
+        logger.error(f"Error incrementing click count for group {group_id}: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error incrementing click count for group {group_id}: {e}", exc_info=True)
         raise

@@ -3,6 +3,7 @@ import sys
 from datetime import datetime, timedelta
 from typing import Dict, Optional
 import pytz
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup # Added imports
 from telegram.error import (
     Forbidden, BadRequest, NetworkError, ChatMigrated, RetryAfter
 )
@@ -122,8 +123,8 @@ class MessageScheduler:
            logger.error(f"Failed to schedule messages for group {group_id}: {e}")
            raise
 
-    async def _send_and_delete_message(self, bot, group_id: str, group_name: str, message_reference: dict, group_data: dict):
-        """Send the message and delete the previous one. Handles fatal errors."""
+    async def _send_and_delete_message(self, bot, group_id: str, group_name: str, message_reference: dict, group_data: dict, message_index: int):
+        """Send the message (with button if it's the first one) and delete the previous one. Handles fatal errors."""
         FATAL_ERRORS = [
             "chat not found",
             "bot was kicked",
@@ -131,11 +132,23 @@ class MessageScheduler:
             "peer_id_invalid",
         ]
         try:
-            logger.debug(f'Attempting to send message to group: {group_name} ({group_id})')
+            logger.debug(f'Attempting to send message index {message_index} to group: {group_name} ({group_id})')
+
+            reply_markup = None
+            if message_index == 0: # Only add button to the first message
+                # Make sure bot_username is available or fetch it if needed
+                # For simplicity, assuming the deep link doesn't need the bot username dynamically here
+                # but ideally it should be fetched or passed in.
+                # Using a placeholder URL for now, needs adjustment in handlers.py later
+                # Corrected: use a callback_data instead of a URL for tracking internal clicks
+                button = InlineKeyboardButton("Get Videos", callback_data=f"get_videos_click_{group_id}")
+                reply_markup = InlineKeyboardMarkup([[button]])
+
             sent_message = await bot.copy_message(
                 chat_id=int(group_id),
                 from_chat_id=message_reference["chat_id"],
-                message_id=message_reference["message_id"]
+                message_id=message_reference["message_id"],
+                reply_markup=reply_markup # Pass the button if applicable
             )
 
             last_msg_id = group_data.get("last_msg_id")
@@ -226,7 +239,7 @@ class MessageScheduler:
                 try:
                     async with timeout(45):
                         sent_message = await self._send_and_delete_message(
-                            bot, group_id, group_name, message_reference_to_send, group_data
+                            bot, group_id, group_name, message_reference_to_send, group_data, index_to_use
                         )
 
                         if sent_message is None:
