@@ -456,29 +456,49 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_get_videos_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles clicks on the 'Get Videos' button."""
+    """Handles clicks on the 'Get Videos' button, increments count, and redirects."""
     query = update.callback_query
+    user_id = query.from_user.id
     try:
-        # Answer the callback query immediately to remove the "loading" state
-        await query.answer()
-
         callback_data = query.data
-        # Extract group_id from callback_data (e.g., "get_videos_click_-100123456")
         prefix = "get_videos_click_"
+        deep_link_url = None
+
         if callback_data.startswith(prefix):
             group_id = callback_data[len(prefix):]
             try:
-                # Increment the click count
+                # Increment the click count first
                 success = await increment_group_click_count(group_id)
                 if success:
-                    logger.info(f"Incremented click count for group {group_id} via button click by user {query.from_user.id}")
+                    logger.info(f"Incremented click count for group {group_id} via button click by user {user_id}")
                 else:
-                     logger.warning(f"Button click for non-existent group {group_id} by user {query.from_user.id}")
-                # No need to reply to the user, the button click itself is the action.
+                     logger.warning(f"Button click for non-existent group {group_id} by user {user_id}")
+
+                # Construct the deep link URL to redirect the user
+                bot_username = (await context.bot.get_me()).username
+                if bot_username:
+                    deep_link_url = f"https://t.me/{bot_username}?startgroup=getvideo"
+                else:
+                    logger.error("Could not get bot username to create deep link URL for redirection.")
+
             except Exception as e:
-                 logger.error(f"Error incrementing click count for group {group_id} on button click: {e}")
+                 logger.error(f"Error processing click count or getting username for group {group_id}: {e}")
+
         else:
              logger.warning(f"Received unexpected callback data: {callback_data}")
 
+        # Answer the callback query. If we have the URL, attempt to redirect.
+        # If URL generation failed, answer normally to stop the loading indicator.
+        if deep_link_url:
+            # Use the url parameter in answerCallbackQuery to suggest opening the link
+            await query.answer(url=deep_link_url)
+            logger.debug(f"Answered callback for group {group_id} with redirect URL suggestion: {deep_link_url}")
+        else:
+            await query.answer("Processing click...") # Generic answer if redirect fails
+
     except Exception as e:
-        logger.error(f"Error handling 'Get Videos' button click: {e}")
+        logger.error(f"Error handling 'Get Videos' button click for user {user_id}: {e}")
+        try:
+            await query.answer("Error processing click.") # Inform user if possible
+        except Exception:
+             pass # Ignore errors during error reporting

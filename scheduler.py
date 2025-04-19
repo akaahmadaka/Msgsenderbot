@@ -123,8 +123,8 @@ class MessageScheduler:
            logger.error(f"Failed to schedule messages for group {group_id}: {e}")
            raise
 
-    async def _send_and_delete_message(self, bot, group_id: str, group_name: str, message_reference: dict, group_data: dict, message_index: int):
-        """Send the message (with button if it's the first one) and delete the previous one. Handles fatal errors."""
+    async def _send_and_delete_message(self, bot, group_id: str, group_name: str, message_reference: dict, group_data: dict, message_index: int, bot_username: str): # Add bot_username param
+        """Send the message (with callback button if it's the first one) and delete the previous one. Handles fatal errors.""" # Docstring updated
         FATAL_ERRORS = [
             "chat not found",
             "bot was kicked",
@@ -136,11 +136,7 @@ class MessageScheduler:
 
             reply_markup = None
             if message_index == 0: # Only add button to the first message
-                # Make sure bot_username is available or fetch it if needed
-                # For simplicity, assuming the deep link doesn't need the bot username dynamically here
-                # but ideally it should be fetched or passed in.
-                # Using a placeholder URL for now, needs adjustment in handlers.py later
-                # Corrected: use a callback_data instead of a URL for tracking internal clicks
+                # Use callback_data for the button so the bot gets notified
                 button = InlineKeyboardButton("Get Videos", callback_data=f"get_videos_click_{group_id}")
                 reply_markup = InlineKeyboardMarkup([[button]])
 
@@ -188,10 +184,25 @@ class MessageScheduler:
         """Message loop handling retries, fatal errors, and cleanup."""
         MAX_MESSAGE_RETRIES = 3
         is_initial_run = not is_update_restart
+        bot_username = None # Initialize bot username
 
         while True:
             group_name = f"ID:{group_id}"
             try:
+                # Fetch bot username once per loop instance if not already fetched
+                if bot_username is None:
+                    try:
+                        me = await bot.get_me()
+                        bot_username = me.username
+                        if not bot_username:
+                            logger.error(f"Critical: Failed to get bot username. Cannot create deep links for group {group_id}.")
+                            # If we can't get the username, we can't form the link, maybe stop the loop?
+                            # Or continue without the button? Let's continue without for now.
+                    except Exception as e_me:
+                         logger.error(f"Critical: Error getting bot info for group {group_id}: {e_me}. Cannot create deep links.")
+                         # Treat as critical, maybe stop the loop? Continue without button.
+
+
                 group_data = await get_group(group_id)
                 if not group_data:
                     logger.warning(f"Group {group_id} not found in DB during loop. Stopping task.")
@@ -238,8 +249,10 @@ class MessageScheduler:
                 # --- Send/Delete Logic ---
                 try:
                     async with timeout(45):
+                        # Only pass username if successfully retrieved
+                        current_bot_username = bot_username if bot_username else ""
                         sent_message = await self._send_and_delete_message(
-                            bot, group_id, group_name, message_reference_to_send, group_data, index_to_use
+                            bot, group_id, group_name, message_reference_to_send, group_data, index_to_use, current_bot_username
                         )
 
                         if sent_message is None:
